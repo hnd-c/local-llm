@@ -27,6 +27,8 @@ pip install -e ".[webui]"
 
 docstack models pull
 
+# After changing [ingest] embedding_model: docstack wipe-index → restart API → re-ingest (see section below).
+
 # Terminal 1
 uvicorn docstack.api:app --host 0.0.0.0 --port 8000
 
@@ -38,25 +40,79 @@ Or run both from the repo: **`./start.sh`** (uses `.venv`). You must include **`
 
 In **Open WebUI**: Settings → Connections → OpenAI API URL: `http://127.0.0.1:8000/v1` — disable built-in document RAG.
 
-**Index a document** (replace mode — wipes previous index):
+#### If summaries look thin or you see “Retrieved 1 source”
 
-- Use the form at [http://127.0.0.1:8000/](http://127.0.0.1:8000/), or  
-- `curl -F "file=@/path/to/doc.pdf" http://127.0.0.1:8000/ingest`
+That UI line usually comes from **Open WebUI’s own attachment / retrieval** when chat is wired to **native Ollama** (`http://127.0.0.1:11434`) instead of **DocStack** (`http://127.0.0.1:8000/v1`). DocStack does not drive that counter.
 
-**Important:** Open WebUI’s in-chat file attachment does **not** call this repo’s `/ingest` or OCR pipeline. Index files through **`/ingest`** (form or `curl`) first, then ask questions in Open WebUI. Optionally disable Open WebUI’s built-in document/RAG features so all answers use your indexed Chroma store.
+1. Set **OpenAI API URL** to **`http://127.0.0.1:8000/v1`** (any non-empty API key is fine).  
+2. Prefer turning **off** Open WebUI’s built-in **Documents / RAG** for attachments so all context comes from DocStack’s **`/ingest`** index.  
+3. **Ingest the PDF through DocStack** (upload at `:8000` or `docstack ingest-file "…/१०० क्रियाकलापहरू (3).pdf"`). Your file (~430 KB) should produce **many** chunks (dozens), not one.  
+4. **Restart the API** after pulling DocStack updates. For summarize-style prompts, a reply that starts with **`_DocStack: starting **full-document map–reduce**`** means the long map–reduce path is running (several minutes is normal).
 
-**CLI**
+## Uploading documents
+
+There are three ways to get a file into DocStack's index:
+
+### Option A — Drag & drop uploader (easiest)
+
+Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in your browser. You get a full drag-and-drop UI with:
+- **Add to index** (default) — accumulate multiple documents
+- **Replace all** — wipe and re-index with just this file
+- Live progress bar while OCR/ingest runs
+- Index size shown at all times
+
+### Option B — Open WebUI chat attachment (seamless)
+
+Install the DocStack Filter Function into Open WebUI **once** and file attachments in the chat box will automatically route through DocStack:
+
+1. Open **Open WebUI → Admin Panel → Functions → + New Function**
+2. Set type to **Filter**
+3. Copy-paste the contents of [`scripts/openwebui_ingest_filter.py`](scripts/openwebui_ingest_filter.py)
+4. **Save** and **enable** the function (globally or per-model)
+
+After that: drag a PDF into any Open WebUI chat message, hit send, and DocStack OCRs and indexes it automatically. The model is notified that the document is ready and will answer using RAG.
+
+> **Valve options** (edit in Open WebUI → Functions → gear icon):
+> `docstack_url` (default `http://localhost:8000`) · `replace_index` (default `false` = accumulate) · `poll_timeout_s` (default `300`)
+
+### Option C — CLI / curl
 
 ```bash
-docstack ingest-file ./sample.pdf
-docstack serve --port 8000
-docstack models pull   # sync Ollama tags with [llm] required_models in settings.toml
+docstack ingest-file ./doc.pdf      # replace mode (wipes previous index)
+docstack models pull                # Ollama tags from [llm] required_models
+docstack wipe-index                 # delete data/chroma + clear embedding cache
 ```
+
+```bash
+curl -F "file=@/path/to/doc.pdf" http://127.0.0.1:8000/ingest/add   # add to index
+curl -F "file=@/path/to/doc.pdf" http://127.0.0.1:8000/ingest        # replace index
+```
+
+## Embeddings & vector DB (change model, reset index)
+
+Do these **in order** whenever you change **`[ingest] embedding_model`** in [configs/settings.toml](configs/settings.toml) (different models use different vector sizes; old Chroma data is invalid).
+
+1. **Edit** `embedding_model` in `configs/settings.toml` (default is multilingual mpnet for Nepali + English).
+2. **Wipe vectors** (pick one):
+   - **`docstack wipe-index`** (recommended — also clears the in-process embedding cache), or  
+   - Manually: **`rm -rf data/chroma`** then **`mkdir -p data/chroma`** (Mac/Linux), or delete the `data\chroma` folder on Windows.
+3. **Restart the DocStack API** (stop `uvicorn` / `./start.sh` / `start.bat` windows, then start again) so **`get_settings()`** reloads TOML and the new SentenceTransformer loads on first embed.
+4. **Re-ingest** every document (`/` upload form, **`POST /ingest`**, or **`docstack ingest-file …`**). The first run may download the new embedding weights.
+
+**Secrets / gitignore:** `.webui_secret_key`, `.env`, and `data/chroma` are ignored from git — see [.gitignore](.gitignore). Open WebUI creates `.webui_secret_key` locally on first run; you do not copy it from the repo.
+
+**Runtime behavior (short):** normal chat uses **RAG** (retrieval + capped history + optional “broad” spread chunks). **Whole-document summarize**-style prompts (English + Nepali patterns in code) may trigger **map–reduce** over many chunks when the index is large enough — see the **Configuration** bullets below. Details: [PLAN.md](PLAN.md).
 
 ## Configuration
 
 Edit [configs/settings.toml](configs/settings.toml). Paths are resolved relative to the repo root.  
 `libreoffice_path` empty string uses the default per OS (see `docstack.config`).
+
+Defaults target **long Nepali government PDFs** (on the order of **~100 pages**): multilingual `[ingest] embedding_model`, larger `chunk_size` / `chunk_overlap`, and higher `[llm]` limits (`retrieval_top_k`, `rag_breadth_chunks`, `max_ctx_chars`, `num_ctx`). Broad-query detection includes **Nepali (Devanagari)** phrases (see `docstack.query.retriever`).
+
+RAG knobs: **`rag_max_history_messages`**, **`rag_breadth_chunks`**, **`rag_min_hits_floor`** (minimum chunks for summarize-style intent when the index is larger), **`retrieval_min_score`**. If **`num_ctx`** causes GPU OOM on **4B**, lower it (e.g. 8192) in `settings.toml`.
+
+**Whole-document map–reduce** (optional, for long summaries): when the user message matches **whole-document** patterns (English + Nepali; see `is_mapreduce_eligible_query` in `workflow/mapreduce.py`) and the index has at least **`mapreduce_min_chunks`** chunks, DocStack runs **parallel map** over (up to **`mapreduce_max_chunks`**) stratified chunks, then **hierarchical reduce**. Tune **`mapreduce_concurrency`**, **`mapreduce_reduce_batch`**, **`mapreduce_deep_final_reduce`**, and set **`mapreduce_enabled = false`** to disable. Output is also written to **`data/outputs/mapreduce_summary.txt`**.
 
 ### Automatically activating `.venv` in new terminals
 
@@ -101,6 +157,8 @@ pip install -e ".[webui]"
 docstack models pull
 ```
 
+After you change **`[ingest] embedding_model`**, run **`docstack wipe-index`**, restart the API, and re-ingest (same steps as the **Embeddings & vector DB** section above).
+
 ### 4. Run everything
 
 From the repo folder, double-click **`start.bat`** or run:
@@ -115,8 +173,8 @@ If `py -3.12` is missing, install Python 3.12 or edit [start.bat](start.bat) / u
 
 ### 5. Same wiring as Mac
 
-- **Open WebUI**: Settings → Connections → **OpenAI API URL** `http://127.0.0.1:8000/v1` (or `http://localhost:8000/v1`), API key any non-empty string — optionally turn off Open WebUI’s built-in document RAG so DocStack owns retrieval.
-- **Index files** via [http://127.0.0.1:8000/](http://127.0.0.1:8000/) or `POST /ingest` — **not** via chat-only attachments in Open WebUI.
+- **Open WebUI**: Settings → Connections → **OpenAI API URL** `http://127.0.0.1:8000/v1` (or `http://localhost:8000/v1`), API key any non-empty string.
+- **Index files** via [http://127.0.0.1:8000/](http://127.0.0.1:8000/) (Option A) or install the Filter Function for seamless chat-box uploads (Option B above).
 
 ## License
 

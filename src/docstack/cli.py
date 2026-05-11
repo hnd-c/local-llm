@@ -11,6 +11,7 @@ import uvicorn
 
 from docstack.chunk.chunker import records_to_chunks
 from docstack.config import get_settings
+from docstack.index.embedder import clear_embedding_model_cache
 from docstack.ingest.router import ingest_path
 from docstack.index.store import index_chunks, wipe_collection
 
@@ -29,6 +30,20 @@ def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None
         reload=reload,
         factory=False,
     )
+
+
+@app.command("wipe-index")
+def wipe_index() -> None:
+    """Delete the Chroma vector store (data/chroma). Edit [ingest] embedding_model first, then re-ingest."""
+    settings = get_settings()
+    chroma = settings.chroma_dir
+    typer.echo(f"Removing {chroma} …")
+    if chroma.exists():
+        shutil.rmtree(chroma)
+    chroma.mkdir(parents=True, exist_ok=True)
+    clear_embedding_model_cache()
+    get_settings.cache_clear()
+    typer.echo("Vector DB wiped and embedding cache cleared. Restart the API, then run ingest again.")
 
 
 @app.command("ingest-file")

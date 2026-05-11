@@ -6,18 +6,40 @@ required_models = ["qwen3:4b", "qwen3:8b"]
 fast_model = "qwen3:4b"
 deep_model = "qwen3:8b"
 ollama_url = "http://127.0.0.1:11434"
-num_ctx = 4096
-max_ctx_chars = 12000
-retrieval_top_k = 8
-retrieval_min_score = 0.4
+# Long Nepali government PDFs (~100 pages): wider context window (lower num_ctx if GPU OOMs).
+num_ctx = 12288
+max_ctx_chars = 30000
+retrieval_top_k = 40
+retrieval_min_score = 0.32
 deep_model_num_gpu = 0
+# RAG: only the last N user/assistant messages are sent (stops unrelated chat polluting doc tasks).
+# 0 = unlimited (not recommended).
+rag_max_history_messages = 32
+# Broad queries (summarize / overview / Nepali equivalents): semantic hits + evenly spaced chunks.
+# ~40 helps ~80–150 chunks (typical for long policy PDFs) see coverage in one turn.
+rag_breadth_chunks = 40
+rag_min_hits_floor = 18
+# Quality single-pass: for summarize/analysis queries with ≤ this many chunks, pack all of
+# them into context in one shot (deepest quality for small-medium docs; 0 = disable).
+full_context_max_chunks = 60
+# Full-document map–reduce for larger docs (n_chunks > full_context_max_chunks).
+mapreduce_enabled = true
+mapreduce_min_chunks = 6
+mapreduce_max_chunks = 96
+mapreduce_concurrency = 3
+mapreduce_reduce_batch = 12
+mapreduce_reduce_input_chars = 14000
+mapreduce_map_chunk_chars = 10000
+mapreduce_deep_final_reduce = true
 
 [ingest]
-chunk_size = 1200
-chunk_overlap = 150
+# Slightly larger chunks preserve Nepali sentences and numbered policy clauses across ~100-page files.
+chunk_size = 2000
+chunk_overlap = 220
 min_chars_per_page = 50
 ocr_confidence_threshold = 70
-embedding_model = "BAAI/bge-small-en-v1.5"
+# Multilingual embeddings (Nepali + English). After changing this, wipe data/chroma/ and re-ingest.
+embedding_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 [paths]
 data_dir = "data"

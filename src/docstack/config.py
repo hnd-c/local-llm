@@ -51,17 +51,36 @@ class Settings(BaseSettings):
     )
     fast_model: str = "qwen3:4b"
     deep_model: str = "qwen3:8b"
-    num_ctx: int = 4096
-    max_ctx_chars: int = 12000
-    retrieval_top_k: int = 8
-    retrieval_min_score: float = 0.4
+    num_ctx: int = 12288
+    max_ctx_chars: int = 30000
+    retrieval_top_k: int = 40
+    retrieval_min_score: float = 0.32
     deep_model_num_gpu: int = 0
+    # RAG: max user+assistant messages after system (0 = no limit).
+    rag_max_history_messages: int = 32
+    # Broad doc queries: evenly spaced chunks merged with semantic hits (0 = off).
+    rag_breadth_chunks: int = 40
+    # Broad / summarize queries: ensure at least this many chunks when the index has more (0 = off).
+    rag_min_hits_floor: int = 18
+    # Quality path: for summarize/analysis queries with ≤ this many chunks, pack ALL chunks into
+    # context in one pass (deepest quality, avoids map-reduce overhead on small docs).
+    # Set to 0 to disable (fall through to map-reduce / RAG).
+    full_context_max_chunks: int = 60
+    # Full-corpus map–reduce for larger docs (kicks in when n_chunks > full_context_max_chunks).
+    mapreduce_enabled: bool = True
+    mapreduce_min_chunks: int = 6
+    mapreduce_max_chunks: int = 96
+    mapreduce_concurrency: int = 3
+    mapreduce_reduce_batch: int = 12
+    mapreduce_reduce_input_chars: int = 14000
+    mapreduce_map_chunk_chars: int = 10000
+    mapreduce_deep_final_reduce: bool = True
 
-    chunk_size: int = 1200
-    chunk_overlap: int = 150
+    chunk_size: int = 2000
+    chunk_overlap: int = 220
     min_chars_per_page: int = 50
     ocr_confidence_threshold: int = 70
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
     data_dir: Path = Field(default=Path("data"))
     chroma_dir: Path = Field(default=Path("data/chroma"))
