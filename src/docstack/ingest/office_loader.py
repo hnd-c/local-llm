@@ -2,18 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import logging
 from pathlib import Path
 
-from docstack.models import DocumentRecord
-
-logger = logging.getLogger(__name__)
-
-
-def _doc_id(path: Path) -> str:
-    st = path.stat()
-    return hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
+from docstack.models import DocumentRecord, make_doc_id
 
 
 def extract_xlsx_records(path: Path) -> list[DocumentRecord]:
@@ -24,7 +15,7 @@ def extract_xlsx_records(path: Path) -> list[DocumentRecord]:
 
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     records: list[DocumentRecord] = []
-    doc_id = _doc_id(path)
+    doc_id = make_doc_id(path)
 
     for sheet_idx, sheet in enumerate(wb.worksheets, 1):
         rows: list[str] = []
@@ -35,7 +26,6 @@ def extract_xlsx_records(path: Path) -> list[DocumentRecord]:
                 rows.append(line)
         if not rows:
             continue
-        # 50-row blocks per sheet section
         block_size = 50
         for i in range(0, len(rows), block_size):
             text = "\n".join(rows[i : i + block_size])
@@ -65,7 +55,7 @@ def extract_pptx_records(path: Path) -> list[DocumentRecord]:
 
     prs = Presentation(str(path))
     records: list[DocumentRecord] = []
-    doc_id = _doc_id(path)
+    doc_id = make_doc_id(path)
 
     for slide_num, slide in enumerate(prs.slides, 1):
         parts: list[str] = []
@@ -75,7 +65,6 @@ def extract_pptx_records(path: Path) -> list[DocumentRecord]:
                     text = "".join(run.text for run in para.runs).strip()
                     if text:
                         parts.append(text)
-            # Tables on slides
             if shape.has_table:
                 for row in shape.table.rows:
                     cells = [cell.text.strip() for cell in row.cells]

@@ -2,25 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import logging
 from pathlib import Path
 
 from docx import Document as DocxDocument
 
-from docstack.models import DocumentRecord
-
-logger = logging.getLogger(__name__)
-
-
-def _doc_id(path: Path) -> str:
-    st = path.stat()
-    h = hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}".encode()).hexdigest()
-    return h[:16]
+from docstack.models import DocumentRecord, make_doc_id
 
 
 def extract_docx_records(path: Path) -> list[DocumentRecord]:
-    doc_id = _doc_id(path)
+    doc_id = make_doc_id(path)
     filename = path.name
     doc = DocxDocument(str(path))
     records: list[DocumentRecord] = []

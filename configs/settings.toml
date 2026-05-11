@@ -2,9 +2,13 @@
 # Models the app expects (fast/deep). These are NOT pip packages — install Ollama, then run:
 #   docstack models pull
 # so local Ollama has the same tags. Change this list if you switch models.
-required_models = ["qwen3:4b", "qwen3:8b"]
+required_models = ["qwen3:4b", "qwen3:8b", "llava"]
 fast_model = "qwen3:4b"
 deep_model = "qwen3:8b"
+# Vision model for image Q&A (photos, screenshots).
+# llava fits with some CPU offloading on 4 GB VRAM.
+# Lighter alternatives: moondream (1.7 GB) or llava-phi3 (2.9 GB).
+vision_model = "llava"
 ollama_url = "http://127.0.0.1:11434"
 # Long Nepali government PDFs (~100 pages): wider context window (lower num_ctx if GPU OOMs).
 num_ctx = 12288
@@ -19,11 +23,14 @@ rag_max_history_messages = 32
 # ~40 helps ~80–150 chunks (typical for long policy PDFs) see coverage in one turn.
 rag_breadth_chunks = 40
 rag_min_hits_floor = 18
-# Quality single-pass: for summarize/analysis queries with ≤ this many chunks, pack all of
-# them into context in one shot (deepest quality for small-medium docs; 0 = disable).
-full_context_max_chunks = 60
-# Full-document map–reduce for larger docs (n_chunks > full_context_max_chunks).
-mapreduce_enabled = true
+# Quality single-pass: pack ALL chunks up to max_ctx_chars in one shot.
+# Set high so this always fires for summarize/analysis queries — map-reduce is too slow
+# on 4 GB GPU hardware. The actual context sent is capped by max_ctx_chars (30 K chars ≈
+# 14–16 chunks of Nepali text), which fits comfortably in a 12 K-token context window.
+full_context_max_chunks = 9999
+# Map–reduce disabled: far too slow on 4 GB GPU (96 chunks = 10+ minutes).
+# Re-enable on more powerful hardware by setting mapreduce_enabled = true.
+mapreduce_enabled = false
 mapreduce_min_chunks = 6
 mapreduce_max_chunks = 96
 mapreduce_concurrency = 3
@@ -37,7 +44,6 @@ mapreduce_deep_final_reduce = true
 chunk_size = 2000
 chunk_overlap = 220
 min_chars_per_page = 50
-ocr_confidence_threshold = 70
 # Multilingual embeddings (Nepali + English). After changing this, wipe data/chroma/ and re-ingest.
 embedding_model = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 

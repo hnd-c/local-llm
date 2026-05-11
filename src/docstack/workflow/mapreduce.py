@@ -8,7 +8,6 @@ import logging
 from docstack.config import get_settings
 from docstack.models import TextChunk
 from docstack.query.ollama_client import chat_once
-from docstack.workflow.schemas import SummaryBullets
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +106,7 @@ async def map_summarize_chunk(
     *,
     num_gpu: int | None,
     max_chars: int,
+    temperature: float | None = None,
 ) -> str:
     settings = get_settings()
     body = text[:max_chars]
@@ -114,7 +114,8 @@ async def map_summarize_chunk(
         {"role": "system", "content": _map_system_prompt(user_query)},
         {"role": "user", "content": f"[Part {idx + 1}]\n{body}"},
     ]
-    return await chat_once(model, messages, num_ctx=settings.num_ctx, num_gpu=num_gpu)
+    return await chat_once(model, messages, num_ctx=settings.num_ctx, num_gpu=num_gpu,
+                           temperature=temperature)
 
 
 async def reduce_summaries_batch(
@@ -125,6 +126,7 @@ async def reduce_summaries_batch(
     num_gpu: int | None,
     max_chars: int,
     final: bool,
+    temperature: float | None = None,
 ) -> str:
     joined = "\n\n".join(f"--- Part {i + 1} ---\n{p}" for i, p in enumerate(partials))
     if len(joined) > max_chars:
@@ -134,7 +136,8 @@ async def reduce_summaries_batch(
         {"role": "system", "content": _reduce_system_prompt(user_query, final=final)},
         {"role": "user", "content": joined},
     ]
-    return await chat_once(model, messages, num_ctx=settings.num_ctx, num_gpu=num_gpu)
+    return await chat_once(model, messages, num_ctx=settings.num_ctx, num_gpu=num_gpu,
+                           temperature=temperature)
 
 
 async def hierarchical_reduce(
@@ -148,6 +151,7 @@ async def hierarchical_reduce(
     deep_final: bool,
     deep_model: str,
     deep_num_gpu: int | None,
+    temperature: float | None = None,
 ) -> str:
     cur = [p for p in partials if p.strip()]
     if not cur:
@@ -156,7 +160,8 @@ async def hierarchical_reduce(
         m = deep_model if deep_final else model
         g = deep_num_gpu if deep_final else num_gpu
         return await reduce_summaries_batch(
-            m, user_query, cur, num_gpu=g, max_chars=max_chars, final=True
+            m, user_query, cur, num_gpu=g, max_chars=max_chars, final=True,
+            temperature=temperature,
         )
 
     while len(cur) > batch:
@@ -164,12 +169,8 @@ async def hierarchical_reduce(
         for i in range(0, len(cur), batch):
             group = cur[i : i + batch]
             merged = await reduce_summaries_batch(
-                model,
-                user_query,
-                group,
-                num_gpu=num_gpu,
-                max_chars=max_chars,
-                final=False,
+                model, user_query, group, num_gpu=num_gpu, max_chars=max_chars,
+                final=False, temperature=temperature,
             )
             nxt.append(merged)
         cur = nxt
@@ -177,7 +178,8 @@ async def hierarchical_reduce(
     m = deep_model if deep_final else model
     g = deep_num_gpu if deep_final else num_gpu
     return await reduce_summaries_batch(
-        m, user_query, cur, num_gpu=g, max_chars=max_chars, final=True
+        m, user_query, cur, num_gpu=g, max_chars=max_chars, final=True,
+        temperature=temperature,
     )
 
 
@@ -187,6 +189,7 @@ async def map_reduce_long_document(
     *,
     model: str,
     num_gpu: int | None,
+    temperature: float | None = None,
 ) -> str:
     """Run parallel map over chunks, then hierarchical reduce. Returns plain text."""
     settings = get_settings()
@@ -204,7 +207,8 @@ async def map_reduce_long_document(
     async def one(c: TextChunk, i: int) -> str:
         async with sem:
             return await map_summarize_chunk(
-                model, user_query, c.text, i, num_gpu=num_gpu, max_chars=max_map
+                model, user_query, c.text, i, num_gpu=num_gpu, max_chars=max_map,
+                temperature=temperature,
             )
 
     logger.info("Map–reduce: mapping %d chunks (concurrency=%d)", len(chunks), conc)
@@ -220,6 +224,7 @@ async def map_reduce_long_document(
         deep_final=deep_final,
         deep_model=settings.deep_model,
         deep_num_gpu=settings.deep_model_num_gpu,
+        temperature=temperature,
     )
 
     settings.outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -228,26 +233,3 @@ async def map_reduce_long_document(
     return text
 
 
-async def map_reduce_chunks(chunks: list[TextChunk], *, use_deep: bool = False) -> SummaryBullets:
-    """Legacy helper: map–reduce with optional deep model for all stages."""
-    settings = get_settings()
-    model = settings.deep_model if use_deep else settings.fast_model
-    num_gpu = settings.deep_model_num_gpu if use_deep else None
-    text = await map_reduce_long_document("Summarize the document.", chunks, model=model, num_gpu=num_gpu)
-    bullets = [
-        b.strip("- ").strip() for b in text.split("\n") if b.strip() and b.strip().startswith("-")
-    ]
-    if not bullets:
-        bullets = [ln.strip() for ln in text.split("\n") if ln.strip()][:50]
-    out = SummaryBullets(
-        bullets=bullets[:50],
-        source_doc=chunks[0].source_filename if chunks else "",
-        review_required=len(chunks) > 40,
-    )
-    out_path = settings.outputs_dir / "mapreduce_summary.json"
-    out_path.write_text(out.model_dump_json(indent=2), encoding="utf-8")
-    return out
-
-
-def run_map_reduce_sync(chunks: list[TextChunk], *, use_deep: bool = False) -> SummaryBullets:
-    return asyncio.run(map_reduce_chunks(chunks, use_deep=use_deep))

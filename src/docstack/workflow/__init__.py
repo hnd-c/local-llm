@@ -1,13 +1,13 @@
-from docstack.workflow.mapreduce import map_reduce_chunks, run_map_reduce_sync
+from docstack.workflow.mapreduce import (
+    is_mapreduce_eligible_query,
+    map_reduce_long_document,
+    stratified_sample_chunks,
+)
 from docstack.workflow.router import select_model_for_prompt
-from docstack.workflow.schemas import ActionItems, ExtractedEntities, QAResult, SummaryBullets
 
 __all__ = [
-    "ActionItems",
-    "ExtractedEntities",
-    "QAResult",
-    "SummaryBullets",
-    "map_reduce_chunks",
-    "run_map_reduce_sync",
+    "is_mapreduce_eligible_query",
+    "map_reduce_long_document",
     "select_model_for_prompt",
+    "stratified_sample_chunks",
 ]

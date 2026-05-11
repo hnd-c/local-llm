@@ -7,11 +7,19 @@ How to install:
   3. Save, then toggle it ON in the Functions list
 
 What it does:
-  When you attach a PDF / DOCX / DOC to a chat message and send it,
-  this filter intercepts the upload, sends the file bytes to DocStack's
-  /ingest/add endpoint, waits for OCR + indexing to finish, then
-  notifies the model that the document is ready. You see live status
-  updates ("Indexing page 3/12…") in the chat while it runs.
+  When you attach a file to a chat message and send it, this filter
+  intercepts the upload, sends the file bytes to DocStack's /ingest/add
+  endpoint, waits for indexing to finish, then notifies the model that
+  the document is ready. Live status updates appear in the chat while
+  it runs. If the same file was already indexed, the result is instant
+  (content-hash cache — no re-processing).
+
+  Processing method depends on file type:
+    • Scanned PDF / image     → OCR (Tesseract) + indexing
+    • Digital PDF             → text extraction + indexing (no OCR)
+    • DOCX / XLSX / PPTX      → native extraction + indexing
+    • TXT / MD / CSV / HTML   → text parsing + indexing
+    • Legacy .doc/.xls/.ppt   → LibreOffice conversion + indexing
 
 Valves (configure in Open WebUI → Functions → gear icon):
   docstack_url   – base URL of the DocStack API (default: http://localhost:8000)
@@ -47,6 +55,12 @@ class Filter:
             default=300,
             description="Max seconds to wait for indexing before giving up (scanned PDFs can take 60–120s)",
         )
+
+    # Per-chat set of filenames indexed in this session.
+    # Keyed by chat_id so each Open WebUI tab is isolated.
+    # Lives in-memory: resets when Open WebUI restarts (that's fine —
+    # the ChromaDB hash cache still skips re-indexing for known files).
+    _session_files: dict[str, set[str]] = {}
 
     def __init__(self):
         self.valves = self.Valves()
@@ -147,16 +161,34 @@ class Filter:
                     {"type": "status", "data": {"description": description, "done": done}}
                 )
 
+        # Resolve the chat_id for session isolation
+        chat_id: str = (
+            body.get("metadata", {}).get("chat_id")
+            or body.get("chat_id")
+            or ""
+        )
+
         # Files come through body["files"] in Open WebUI
         raw_files = body.get("files", [])
         if not raw_files:
+            # No file attached in this message. If this chat has never had a
+            # document indexed, signal DocStack to skip RAG entirely so a stale
+            # index from a different session doesn't pollute the answer.
+            if not self._session_files.get(chat_id):
+                existing = [m for m in body.get("messages", []) if m.get("role") != "system"]
+                body["messages"] = [
+                    {"role": "system", "content": "[DocStack:no-rag] No document attached in this chat session. Answer as a general-purpose assistant."}
+                ] + existing
             return body
 
-        # Filter to document types DocStack supports
+        # Document types sent to DocStack for extraction + indexing.
+        # Plain images (jpg/png/etc.) are intentionally excluded so they pass
+        # through to the LLM as native image attachments (requires a vision
+        # model such as llava or qwen2.5-vl). To OCR-index an image document,
+        # use the drag-and-drop uploader at http://localhost:8000 instead.
         _SUPPORTED_EXT = {
             "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt",
             "txt", "md", "markdown", "csv", "html", "htm",
-            "jpg", "jpeg", "png", "tiff", "tif", "bmp", "webp",
             "odt", "ods", "odp", "rtf",
         }
         doc_files = [
@@ -167,8 +199,19 @@ class Filter:
         if not doc_files:
             return body
 
-        ingested: list[str] = []
-        errors: list[str] = []
+        # Per-extension labels: what processing actually runs for each type
+        _NATIVE_EXTS = {"docx", "xlsx", "pptx", "txt", "md", "markdown", "csv", "html", "htm"}
+        _LO_EXTS     = {"doc", "xls", "ppt", "odt", "ods", "odp", "rtf"}
+
+        def _process_label(filename: str) -> str:
+            ext = filename.lower().rsplit(".", 1)[-1]
+            if ext == "pdf":
+                return "indexing (OCR if scanned)"
+            if ext in _NATIVE_EXTS:
+                return "indexing"
+            if ext in _LO_EXTS:
+                return "converting + indexing"
+            return "indexing"
 
         ingested: list[str] = []
         errors: list[str] = []
@@ -184,8 +227,10 @@ class Filter:
                 errors.append(f"{name}: download failed — {e}")
                 continue
 
+            label = _process_label(fname)
+
             # 2. Start ingest (non-blocking on DocStack side — runs in bg thread)
-            await emit(f"📤 Sending {fname} to DocStack for OCR + indexing…")
+            await emit(f"📤 Sending {fname} to DocStack for {label}…")
             try:
                 self._start_ingest(fname, data)
             except Exception as e:
@@ -200,7 +245,14 @@ class Filter:
                 status = s.get("status", "")
                 if status == "completed":
                     ingested.append(fname)
-                    await emit(f"✅ Indexed {fname} — generating answer…", done=True)
+                    # Register this file against the chat session so future
+                    # turns in this same tab continue to use the index.
+                    if chat_id:
+                        self._session_files.setdefault(chat_id, set()).add(fname)
+                    if s.get("cached"):
+                        await emit(f"⚡ {fname} already indexed — generating answer…", done=True)
+                    else:
+                        await emit(f"✅ Indexed {fname} — generating answer…", done=True)
                     break
                 if status == "failed":
                     errors.append(f"{fname}: {s.get('error', 'unknown error')}")
@@ -211,7 +263,7 @@ class Filter:
                     total = s.get("pages_total", "?")
                     elapsed = int(s.get("elapsed_s") or 0)
                     await emit(
-                        f"⏳ OCR + indexing {fname} — page {page}/{total} · {elapsed}s elapsed…"
+                        f"⏳ {label} {fname} — page {page}/{total} · {elapsed}s elapsed…"
                     )
             else:
                 errors.append(f"{fname}: timed out after {self.valves.poll_timeout_s}s")
@@ -221,15 +273,17 @@ class Filter:
         # Even with file_handler=True, the file reference stays inside the
         # user message content list and triggers Open WebUI's own RAG template
         # (which injects <source id="1"> metadata with no actual text).
-        # Remove non-text parts so Open WebUI's RAG template never fires.
+        # Keep text parts and image_url parts (base64 inline images for vision
+        # models); drop everything else so the RAG template never fires.
         for m in body.get("messages", []):
             if m.get("role") == "user" and isinstance(m.get("content"), list):
-                text_parts = [p for p in m["content"] if p.get("type") == "text"]
-                if text_parts:
-                    m["content"] = text_parts[0].get("text", "") if len(text_parts) == 1 else \
-                        "\n".join(p.get("text", "") for p in text_parts)
-                else:
+                kept = [p for p in m["content"] if p.get("type") in ("text", "image_url")]
+                if not kept:
                     m["content"] = ""
+                elif len(kept) == 1 and kept[0].get("type") == "text":
+                    m["content"] = kept[0].get("text", "")
+                else:
+                    m["content"] = kept
 
         # Inject context note so the LLM answers using the freshly indexed doc
         notes: list[str] = []

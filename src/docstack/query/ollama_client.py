@@ -3,23 +3,23 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+
 
 import httpx
 
 from docstack.config import get_settings
 
-logger = logging.getLogger(__name__)
-
 
 async def chat_stream(
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     num_ctx: int | None = None,
     num_gpu: int | None = None,
+    temperature: float | None = None,
 ) -> AsyncIterator[str]:
     settings = get_settings()
     url = f"{settings.ollama_url.rstrip('/')}/api/chat"
@@ -33,6 +33,8 @@ async def chat_stream(
         payload["options"]["num_ctx"] = num_ctx
     if num_gpu is not None:
         payload["options"]["num_gpu"] = num_gpu
+    if temperature is not None:
+        payload["options"]["temperature"] = temperature
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
         async with client.stream("POST", url, json=payload) as resp:
@@ -54,12 +56,13 @@ async def chat_stream(
 
 async def chat_once(
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     num_ctx: int | None = None,
     num_gpu: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     parts: list[str] = []
-    async for p in chat_stream(model, messages, num_ctx=num_ctx, num_gpu=num_gpu):
+    async for p in chat_stream(model, messages, num_ctx=num_ctx, num_gpu=num_gpu, temperature=temperature):
         parts.append(p)
     return "".join(parts)

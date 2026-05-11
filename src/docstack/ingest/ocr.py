@@ -4,10 +4,23 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def tesseract_langs() -> list[str]:
+    """Return ['nep', 'eng'] if Nepali tessdata is available, else ['eng']."""
+    try:
+        r = subprocess.run(
+            ["tesseract", "--list-langs"], capture_output=True, text=True, timeout=10
+        )
+        available = {ln.strip() for ln in r.stdout.splitlines() + r.stderr.splitlines()}
+        return ["nep", "eng"] if "nep" in available else ["eng"]
+    except Exception:  # noqa: BLE001
+        return ["eng"]
 
 
 def ocrmypdf_available() -> bool:
@@ -34,19 +47,7 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path | None = None) -> Path:
             "ocrmypdf package not installed. Run: pip install ocrmypdf"
         ) from exc
 
-    # Use Nepali + English for Devanagari script; fall back to eng-only if nep pack missing.
-    import subprocess
-
-    available_langs = set()
-    try:
-        r = subprocess.run(
-            ["tesseract", "--list-langs"], capture_output=True, text=True, timeout=10
-        )
-        available_langs = {ln.strip() for ln in r.stdout.splitlines() + r.stderr.splitlines()}
-    except Exception:  # noqa: BLE001
-        pass
-
-    langs = ["nep", "eng"] if "nep" in available_langs else ["eng"]
+    langs = tesseract_langs()
     logger.info("Running OCR (Python API, langs=%s): %s → %s", "+".join(langs), input_pdf, output_pdf)
     result = ocrmypdf.ocr(
         input_pdf,

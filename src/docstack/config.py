@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     )
     fast_model: str = "qwen3:4b"
     deep_model: str = "qwen3:8b"
+    vision_model: str = "llava"
     num_ctx: int = 12288
     max_ctx_chars: int = 30000
     retrieval_top_k: int = 40
@@ -79,7 +80,6 @@ class Settings(BaseSettings):
     chunk_size: int = 2000
     chunk_overlap: int = 220
     min_chars_per_page: int = 50
-    ocr_confidence_threshold: int = 70
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
     data_dir: Path = Field(default=Path("data"))
@@ -122,7 +122,6 @@ def _merge_toml_into_settings(s: Settings) -> Settings:
         "chunk_size": "chunk_size",
         "chunk_overlap": "chunk_overlap",
         "min_chars_per_page": "min_chars_per_page",
-        "ocr_confidence_threshold": "ocr_confidence_threshold",
         "embedding_model": "embedding_model",
     }
     for tk, sk in mapping_ingest.items():

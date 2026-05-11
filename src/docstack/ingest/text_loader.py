@@ -3,24 +3,18 @@
 from __future__ import annotations
 
 import csv as _csv
-import hashlib
 import io
 import logging
 from pathlib import Path
 
-from docstack.models import DocumentRecord
+from docstack.models import DocumentRecord, make_doc_id
 
 logger = logging.getLogger(__name__)
 
 
-def _doc_id(path: Path) -> str:
-    st = path.stat()
-    return hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
-
-
 def _make(path: Path, mime: str, text: str, page: int = 1, block_type: str = "text") -> DocumentRecord:
     return DocumentRecord(
-        doc_id=_doc_id(path),
+        doc_id=make_doc_id(path),
         source_path=str(path.resolve()),
         filename=path.name,
         mime=mime,
@@ -41,7 +35,6 @@ def extract_markdown_records(path: Path) -> list[DocumentRecord]:
     raw = path.read_text(encoding="utf-8", errors="replace").strip()
     if not raw:
         return []
-    # Strip markdown syntax to plain text for embedding
     try:
         import markdown
         from bs4 import BeautifulSoup
@@ -72,7 +65,6 @@ def extract_csv_records(path: Path) -> list[DocumentRecord]:
         rows = [row for row in reader if any(c.strip() for c in row)]
         if not rows:
             return []
-        # Each 50-row block becomes one record (keeps chunk size manageable)
         block_size = 50
         for i in range(0, len(rows), block_size):
             block = rows[i : i + block_size]

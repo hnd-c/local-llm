@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 
 import fitz  # PyMuPDF
 
-from docstack.models import DocumentRecord
+from docstack.models import DocumentRecord, make_doc_id
 
 logger = logging.getLogger(__name__)
-
-
-def _doc_id(path: Path) -> str:
-    st = path.stat()
-    h = hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}".encode()).hexdigest()
-    return h[:16]
 
 
 def _avg_chars_per_page(doc: fitz.Document) -> float:
@@ -36,7 +29,7 @@ def extract_pdf_records(
 ) -> list[DocumentRecord]:
     """Extract DocumentRecords from a PDF (optionally already OCR'd file)."""
     path = ocr_pdf_path or pdf_path
-    doc_id = _doc_id(pdf_path)
+    doc_id = make_doc_id(pdf_path)
     filename = pdf_path.name
     records: list[DocumentRecord] = []
     doc = fitz.open(path)

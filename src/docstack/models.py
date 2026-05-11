@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+
+
+def make_doc_id(path: Path) -> str:
+    """Stable 16-hex ID derived from file path + mtime (ns)."""
+    st = path.stat()
+    return hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
 
 
 @dataclass
@@ -19,21 +26,6 @@ class DocumentRecord:
     ocr_confidence: float | None = None
     section_heading: str | None = None
     table_id: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "doc_id": self.doc_id,
-            "source_path": self.source_path,
-            "filename": self.filename,
-            "mime": self.mime,
-            "page": self.page,
-            "block_type": self.block_type,
-            "text": self.text,
-            "bbox": list(self.bbox) if self.bbox else None,
-            "ocr_confidence": self.ocr_confidence,
-            "section_heading": self.section_heading,
-            "table_id": self.table_id,
-        }
 
 
 @dataclass

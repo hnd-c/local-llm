@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import secrets
@@ -59,9 +60,75 @@ def _page_count(path: Path) -> int:
     return 1
 
 
+def _sha256(path: Path) -> str:
+    """SHA-256 of file contents — true content fingerprint regardless of filename."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _registry_path() -> Path:
+    """JSON file that maps content hashes → ingest metadata, stored next to ChromaDB."""
+    return get_settings().chroma_dir / "indexed_hashes.json"
+
+
+def _load_registry() -> dict[str, Any]:
+    p = _registry_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:  # noqa: BLE001
+            pass
+    return {}
+
+
+def _save_registry(reg: dict[str, Any]) -> None:
+    p = _registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(reg, indent=2))
+
+
+def _clear_registry() -> None:
+    p = _registry_path()
+    if p.exists():
+        p.unlink()
+
+
 def _run_ingest_job(job_id: str, saved_path: Path, *, replace: bool = True) -> None:
     settings = get_settings()
     global _ingest_state
+
+    file_hash = _sha256(saved_path)
+
+    # Check if this exact file content is already indexed (skip-cache).
+    # Only applies for additive ingests; a replace=True call always wipes and re-indexes.
+    if not replace:
+        reg = _load_registry()
+        if file_hash in reg and collection_chunk_count() > 0:
+            cached = reg[file_hash]
+            logger.info(
+                "Skipping ingest — file already indexed (hash=%s, chunks=%s, file=%s)",
+                file_hash[:12],
+                cached.get("chunk_count"),
+                cached.get("filename"),
+            )
+            with _ingest_lock:
+                _ingest_state.update(
+                    {
+                        "status": "completed",
+                        "job_id": job_id,
+                        "pages_done": cached.get("pages", 1),
+                        "pages_total": cached.get("pages", 1),
+                        "active_doc": saved_path.name,
+                        "error": None,
+                        "started_at": time.time(),
+                        "cached": True,
+                    }
+                )
+            return
+
     try:
         with _ingest_lock:
             _ingest_state.update(
@@ -73,13 +140,24 @@ def _run_ingest_job(job_id: str, saved_path: Path, *, replace: bool = True) -> N
                     "active_doc": saved_path.name,
                     "error": None,
                     "started_at": time.time(),
+                    "cached": False,
                 }
             )
         if replace:
             wipe_collection()
+            _clear_registry()
         records = ingest_path(saved_path, settings.min_chars_per_page)
         chunks = records_to_chunks(records)
         index_chunks(chunks)
+        # Register the content hash so future uploads of the same file are skipped.
+        reg = _load_registry()
+        reg[file_hash] = {
+            "filename": saved_path.name,
+            "chunk_count": len(chunks),
+            "pages": _ingest_state.get("pages_total", 1),
+            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        _save_registry(reg)
         with _ingest_lock:
             _ingest_state.update(
                 {
@@ -209,7 +287,7 @@ btn.addEventListener('click', async () => {
     const j = await r.json();
     if (!r.ok) throw new Error(j.detail || r.statusText);
     showStatus('ok', '✅ ' + j.message + ' (job ' + j.job_id + '). Polling for completion…');
-    poll(j.job_id);
+    poll();
   } catch(e) {
     showStatus('err', '❌ ' + e.message);
     btn.disabled = false; btn.textContent = 'Retry';
@@ -286,6 +364,14 @@ async def ingest_chunks() -> dict[str, int]:
     return {"count": collection_chunk_count()}
 
 
+@app.delete("/ingest/wipe")
+async def ingest_wipe() -> dict[str, str]:
+    """Wipe the entire vector index and hash registry."""
+    wipe_collection()
+    _clear_registry()
+    return {"status": "wiped", "chunks": "0"}
+
+
 async def _save_and_start(file: UploadFile, *, replace: bool) -> JSONResponse:
     settings = get_settings()
     dest = settings.uploads_dir / (file.filename or "upload.bin")
@@ -329,6 +415,7 @@ class ChatCompletionRequest(BaseModel):
 _OWUI_TASK_PREFIX = "### Task:\n"
 _OWUI_RAG_MARKER = "### Task:\nRespond to the user query using the provided context"
 _OWUI_CONTEXT_END = "</context>"
+_DOCSTACK_NO_RAG = "[DocStack:no-rag]"
 
 
 def _strip_owui_rag_template(text: str) -> str:
@@ -356,6 +443,76 @@ def _is_owui_internal_task(messages: list[ChatMessage]) -> bool:
     return text.startswith(_OWUI_TASK_PREFIX) and _OWUI_RAG_MARKER not in text
 
 
+def _has_image_content(messages: list[ChatMessage]) -> bool:
+    """Return True if any user message contains an inline image (image_url part)."""
+    for m in messages:
+        if m.role != "user":
+            continue
+        if isinstance(m.content, list):
+            for part in m.content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
+def _to_ollama_vision_messages(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """Convert OpenAI-style messages (with image_url content parts) to Ollama's
+    vision format, where images are a top-level list of raw base64 strings."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        # Strip DocStack system signals; keep real system prompts
+        if m.role == "system":
+            c = m.content if isinstance(m.content, str) else ""
+            if _DOCSTACK_NO_RAG in c:
+                continue
+        content = m.content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            images: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:") and "," in url:
+                        images.append(url.split(",", 1)[1])
+                    elif url:
+                        images.append(url)
+            msg: dict[str, Any] = {"role": m.role, "content": " ".join(text_parts).strip()}
+            if images:
+                msg["images"] = images
+            out.append(msg)
+        else:
+            out.append({"role": m.role, "content": _message_text(m, "")})
+    return out
+
+
+def _is_no_rag_session(messages: list[ChatMessage]) -> bool:
+    """Return True when the filter has signaled that no document is active
+    in this chat session — forward straight to Ollama without RAG."""
+    for m in messages:
+        if m.role == "system":
+            c = m.content
+            text = c if isinstance(c, str) else ""
+            if _DOCSTACK_NO_RAG in text:
+                return True
+    return False
+
+
+def _strip_no_rag_signal(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """Return Ollama-format messages with the no-rag system message removed."""
+    out = []
+    for m in messages:
+        if m.role == "system":
+            c = m.content if isinstance(m.content, str) else ""
+            if _DOCSTACK_NO_RAG in c:
+                continue  # drop the signal; don't send it to the LLM
+        out.append({"role": m.role, "content": _message_text(m, "")})
+    return out
+
+
 def _last_user_text(messages: list[ChatMessage]) -> str:
     for m in reversed(messages):
         if m.role != "user":
@@ -376,7 +533,9 @@ def _last_user_text(messages: list[ChatMessage]) -> str:
 def _message_text(m: ChatMessage, fallback_user: str) -> str:
     c = m.content
     if isinstance(c, str):
-        return c
+        # Strip OWUI RAG template so Ollama sees only the real query,
+        # not the empty <context> tags that override our system prompt.
+        return _strip_owui_rag_template(c)
     if m.role == "user" and isinstance(c, list):
         return fallback_user
     return ""
@@ -463,7 +622,7 @@ async def chat_completions(body: ChatCompletionRequest):
         if not body.stream:
             async def _collect_task() -> str:
                 buf: list[str] = []
-                async for p in chat_stream(model_name, ollama_msgs):
+                async for p in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
                     buf.append(p)
                 return "".join(buf)
             text = await _collect_task()
@@ -475,7 +634,66 @@ async def chat_completions(body: ChatCompletionRequest):
                               "finish_reason": "stop"}],
             })
         async def _stream_task() -> Any:
-            async for piece in chat_stream(model_name, ollama_msgs):
+            async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
+                if piece:
+                    yield _sse_chunk(content=piece, model=model_name, cid=cid)
+            yield _sse_chunk(content="", model=model_name, cid=cid, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_stream_task(), media_type="text/event-stream")
+
+    # ── Vision / image requests ─────────────────────────────────────────────
+    # If the user's message contains an inline image (image_url), route to the
+    # vision model and skip RAG entirely — document context is irrelevant for
+    # visual Q&A. Images are converted from OpenAI data-URL format to Ollama's
+    # images[] array format.
+    if _has_image_content(body.messages):
+        vision_model = body.model or settings.vision_model
+        vision_msgs = _to_ollama_vision_messages(body.messages)
+        if not body.stream:
+            async def _collect_vision() -> str:
+                buf: list[str] = []
+                async for p in chat_stream(vision_model, vision_msgs, temperature=body.temperature):
+                    buf.append(p)
+                return "".join(buf)
+            text = await _collect_vision()
+            return JSONResponse({
+                "id": cid, "object": "chat.completion",
+                "created": int(time.time()), "model": vision_model,
+                "choices": [{"index": 0,
+                              "message": {"role": "assistant", "content": text},
+                              "finish_reason": "stop"}],
+            })
+        async def _stream_vision() -> Any:
+            async for piece in chat_stream(vision_model, vision_msgs, temperature=body.temperature):
+                if piece:
+                    yield _sse_chunk(content=piece, model=vision_model, cid=cid)
+            yield _sse_chunk(content="", model=vision_model, cid=cid, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_stream_vision(), media_type="text/event-stream")
+
+    # ── No-document session bypass ──────────────────────────────────────────
+    # The filter injects [DocStack:no-rag] when no file has been attached in
+    # this chat tab, so a stale index from a previous session is never used.
+    # Forward directly to Ollama as a plain assistant conversation.
+    if _is_no_rag_session(body.messages):
+        model_name = body.model or settings.fast_model
+        ollama_msgs = _strip_no_rag_signal(body.messages)
+        if not body.stream:
+            async def _collect_task() -> str:
+                buf: list[str] = []
+                async for p in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
+                    buf.append(p)
+                return "".join(buf)
+            text = await _collect_task()
+            return JSONResponse({
+                "id": cid, "object": "chat.completion",
+                "created": int(time.time()), "model": model_name,
+                "choices": [{"index": 0,
+                              "message": {"role": "assistant", "content": text},
+                              "finish_reason": "stop"}],
+            })
+        async def _stream_task() -> Any:
+            async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
                 if piece:
                     yield _sse_chunk(content=piece, model=model_name, cid=cid)
             yield _sse_chunk(content="", model=model_name, cid=cid, finish_reason="stop")
@@ -564,7 +782,8 @@ async def chat_completions(body: ChatCompletionRequest):
             async def collect_fc() -> str:
                 buf: list[str] = []
                 async for p in chat_stream(
-                    model_name, fc_messages, num_ctx=settings.num_ctx, num_gpu=num_gpu
+                    model_name, fc_messages, num_ctx=settings.num_ctx, num_gpu=num_gpu,
+                    temperature=body.temperature,
                 ):
                     buf.append(p)
                 return "".join(buf)
@@ -588,7 +807,8 @@ async def chat_completions(body: ChatCompletionRequest):
 
         async def stream_full_context() -> Any:
             async for piece in chat_stream(
-                model_name, fc_messages, num_ctx=settings.num_ctx, num_gpu=num_gpu
+                model_name, fc_messages, num_ctx=settings.num_ctx, num_gpu=num_gpu,
+                temperature=body.temperature,
             ):
                 if piece:
                     yield _sse_chunk(content=piece, model=model_name, cid=cid)
@@ -608,7 +828,7 @@ async def chat_completions(body: ChatCompletionRequest):
         sub = stratified_sample_chunks(all_chunks, settings.mapreduce_max_chunks)
         if not body.stream:
             result_text = await map_reduce_long_document(
-                user_text, sub, model=model_name, num_gpu=num_gpu
+                user_text, sub, model=model_name, num_gpu=num_gpu, temperature=body.temperature
             )
             return JSONResponse(
                 {
@@ -636,7 +856,7 @@ async def chat_completions(body: ChatCompletionRequest):
                 cid=cid,
             )
             result_text = await map_reduce_long_document(
-                user_text, sub, model=model_name, num_gpu=num_gpu
+                user_text, sub, model=model_name, num_gpu=num_gpu, temperature=body.temperature
             )
             step = 200
             for i in range(0, len(result_text), step):
@@ -663,7 +883,7 @@ async def chat_completions(body: ChatCompletionRequest):
                 model_name,
                 ollama_messages,
                 num_ctx=settings.num_ctx,
-                num_gpu=num_gpu,
+                num_gpu=num_gpu, temperature=body.temperature,
             ):
                 buf.append(p)
             return "".join(buf)
@@ -690,7 +910,7 @@ async def chat_completions(body: ChatCompletionRequest):
             model_name,
             ollama_messages,
             num_ctx=settings.num_ctx,
-            num_gpu=num_gpu,
+            num_gpu=num_gpu, temperature=body.temperature,
         ):
             if piece:
                 yield _sse_chunk(content=piece, model=model_name, cid=cid)
@@ -704,20 +924,18 @@ async def chat_completions(body: ChatCompletionRequest):
 async def list_models() -> dict[str, Any]:
     settings = get_settings()
     now = int(time.time())
+    # Deduplicate while preserving order: fast → deep → vision → extras
+    seen: set[str] = set()
+    model_ids: list[str] = []
+    for mid in [settings.fast_model, settings.deep_model, settings.vision_model,
+                *settings.required_models]:
+        if mid and mid not in seen:
+            seen.add(mid)
+            model_ids.append(mid)
     return {
         "object": "list",
         "data": [
-            {
-                "id": settings.fast_model,
-                "object": "model",
-                "created": now,
-                "owned_by": "docstack",
-            },
-            {
-                "id": settings.deep_model,
-                "object": "model",
-                "created": now,
-                "owned_by": "docstack",
-            },
+            {"id": mid, "object": "model", "created": now, "owned_by": "docstack"}
+            for mid in model_ids
         ],
     }
