@@ -1,0 +1,37 @@
+# --- Secrets & local env (never commit) ---
+.env
+.env.*
+!.env.example
+.webui_secret_key
+*.pem
+*.p12
+id_rsa
+id_rsa.pub
+*.secret
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+.venv-webui/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- App data (local only) ---
+data/chroma/
+data/uploads/
+data/outputs/
+# Ollama log from start.sh / start.bat (also matched by *.log)
+data/ollama-serve.log
+
+# --- OS / editor noise ---
+.DS_Store
+*.log
