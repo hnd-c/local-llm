@@ -6,6 +6,7 @@ cd /d "%~dp0"
 
 if not defined OLLAMA_URL set "OLLAMA_URL=http://127.0.0.1:11434"
 
+REM ── Check Ollama ──────────────────────────────────────────────────────────────
 curl -sf --max-time 2 "%OLLAMA_URL%/api/tags" >nul 2>&1
 if not errorlevel 1 (
   echo Ollama is running at %OLLAMA_URL%
@@ -14,8 +15,11 @@ if not errorlevel 1 (
 
 where ollama >nul 2>&1
 if errorlevel 1 (
-  echo Ollama is not running and ollama.exe was not found on PATH.
-  echo Install from https://ollama.com or start the Ollama app, then re-run start.bat
+  echo.
+  echo ERROR: Ollama is not running and ollama.exe was not found on PATH.
+  echo Install from https://ollama.com or start the Ollama tray app, then re-run start.bat
+  echo.
+  pause
   exit /b 1
 )
 
@@ -27,12 +31,13 @@ set i=0
 :wait_ollama
 curl -sf --max-time 2 "%OLLAMA_URL%/api/tags" >nul 2>&1
 if not errorlevel 1 (
-  echo Ollama is up at %OLLAMA_URL%  Log: %~dp0data\ollama-serve.log
+  echo Ollama is up at %OLLAMA_URL%
   goto :after_ollama
 )
 set /a i+=1
 if !i! geq 11 (
-  echo Ollama did not become ready (tried ~10s). See %~dp0data\ollama-serve.log
+  echo ERROR: Ollama did not become ready after 10s. See %~dp0data\ollama-serve.log
+  pause
   exit /b 1
 )
 timeout /t 1 /nobreak >nul
@@ -40,37 +45,88 @@ goto :wait_ollama
 
 :after_ollama
 
-REM ── Check required models are pulled ─────────────────────────────────────────
+REM ── Check required models ─────────────────────────────────────────────────────
 echo.
 echo Checking Ollama models...
-ollama list 2>nul
-if errorlevel 1 (
-  echo WARNING: Could not query Ollama model list.
-) else (
-  echo Required: qwen3:4b  qwen3:8b  qwen2.5vl
-  echo If any are missing, run: docstack models pull
-)
+REM Note: "failed to get console mode for stderr" is a harmless Go warning — not an error.
+ollama list
+echo.
+echo Required: qwen3:4b  qwen3:8b  qwen2.5vl:7b
+echo If any are missing, run:  docstack models pull
 echo.
 
-REM ── Free ports 8000 and 3000 before starting (kills any leftover processes) ──
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R ":8000 .*LISTENING" 2^>nul') do (
-  echo Stopping process on port 8000 (PID: %%p)...
+REM ── Free ports 8000 and 3000 before starting ─────────────────────────────────
+for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8000 "') do (
   taskkill /PID %%p /F >nul 2>&1
 )
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R ":3000 .*LISTENING" 2^>nul') do (
-  echo Stopping process on port 3000 (PID: %%p)...
+for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3000 "') do (
   taskkill /PID %%p /F >nul 2>&1
 )
 
+REM ── Ensure .venv exists ───────────────────────────────────────────────────────
 if not exist ".venv\Scripts\uvicorn.exe" (
-  echo Create .venv first: py -3.12 -m venv .venv ^&^& .venv\Scripts\activate ^&^& pip install -U pip ^&^& pip install -e ".[webui]"
-  exit /b 1
+  echo.
+  echo .venv not found or incomplete. Setting up Python environment now...
+  echo This may take 5-15 minutes on first run.
+  echo.
+
+  where py >nul 2>&1
+  if errorlevel 1 (
+    echo ERROR: Python launcher "py" not found.
+    echo Install Python 3.12 from https://www.python.org/downloads/
+    echo Make sure to check "Add Python to PATH" during install.
+    echo.
+    pause
+    exit /b 1
+  )
+
+  py -3.12 --version >nul 2>&1
+  if errorlevel 1 (
+    echo ERROR: Python 3.12 not found. Install it from https://www.python.org/downloads/
+    echo.
+    pause
+    exit /b 1
+  )
+
+  echo Creating .venv with Python 3.12...
+  py -3.12 -m venv .venv
+  if errorlevel 1 (
+    echo ERROR: Failed to create .venv
+    pause
+    exit /b 1
+  )
+
+  echo Installing packages (this takes a while)...
+  .venv\Scripts\pip install -U pip
+  .venv\Scripts\pip install -e ".[webui]"
+  if errorlevel 1 (
+    echo ERROR: pip install failed. Check the output above for details.
+    pause
+    exit /b 1
+  )
+
+  echo.
+  echo Setup complete!
+  echo.
 )
+
+REM ── Launch DocStack and Open WebUI ────────────────────────────────────────────
+echo Starting DocStack API on port 8000...
 start "DocStack API" /D "%~dp0" cmd /k ".venv\Scripts\uvicorn.exe docstack.api:app --host 0.0.0.0 --port 8000"
+
 if exist ".venv\Scripts\open-webui.exe" (
+  echo Starting Open WebUI on port 3000...
   start "Open WebUI" /D "%~dp0" cmd /k ".venv\Scripts\open-webui.exe serve --port 3000"
 ) else (
-  echo open-webui not in .venv. Run: pip install -e ".[webui]" with Python 3.12
+  echo.
+  echo WARNING: open-webui not found in .venv.
+  echo Run: .venv\Scripts\pip install -e ".[webui]"
+  echo.
 )
+
+echo.
+echo DocStack upload UI:  http://127.0.0.1:8000
+echo Open WebUI:          http://localhost:3000
+echo.
 
 endlocal
