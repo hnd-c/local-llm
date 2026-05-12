@@ -44,7 +44,19 @@ Or run both from the repo: **`./start.sh`** (uses `.venv`). You must include **`
 
 Open **Open WebUI** at **[http://localhost:3000](http://localhost:3000)**.
 
-In **Open WebUI**: Settings → Connections → OpenAI API URL: `http://127.0.0.1:8000/v1` — disable built-in document RAG.
+### Wiring Open WebUI to DocStack (required after first run or after `wipe-chats`)
+
+> ⚠️ Without this step, Open WebUI talks directly to Ollama (`http://localhost:11434`) and **bypasses DocStack entirely** — no RAG, no URL fetching, no document context.
+
+1. Go to **Admin Panel → Settings → Connections**
+2. Under **OpenAI API**, click the **gear icon** next to the URL
+3. Change the URL to: **`http://127.0.0.1:8000/v1`**
+4. Set any non-empty API key (e.g. `docstack`)
+5. Save
+
+**Ollama API** (`http://localhost:11434`) can stay connected — it's fine for general chat. But only models selected from the DocStack endpoint (`http://127.0.0.1:8000/v1`) go through RAG, URL fetching, and document context. Models accessed via Ollama direct bypass all of that.
+
+After saving, the model dropdown will show `qwen3:4b`, `qwen3:8b`, `qwen2.5vl:7b` from DocStack — select one of these for full functionality.
 
 #### If summaries look thin or you see "Retrieved 1 source"
 
@@ -93,6 +105,14 @@ After that: drag a PDF / DOCX / spreadsheet into any Open WebUI chat message, hi
 docstack ingest-file ./doc.pdf      # replace mode (wipes previous index)
 docstack models pull                # Ollama tags from [llm] required_models
 docstack wipe-index                 # delete data/chroma + clear embedding cache
+docstack wipe-chats                 # clear Open WebUI chat history + uploads
+docstack wipe-all                   # full clean slate (index + chats + uploads + logs)
+```
+
+Add `-y` to any wipe command to skip the confirmation prompt:
+```bash
+docstack wipe-chats -y
+docstack wipe-all -y
 ```
 
 ```bash
@@ -100,6 +120,16 @@ curl -F "file=@/path/to/doc.pdf" http://127.0.0.1:8000/ingest/add   # add to ind
 curl -F "file=@/path/to/doc.pdf" http://127.0.0.1:8000/ingest        # replace index
 curl -X DELETE http://127.0.0.1:8000/ingest/wipe                     # wipe index + hash registry
 ```
+
+#### What each wipe command clears
+
+| Command | What it removes | Effect on performance |
+|---|---|---|
+| `wipe-index` | `data/chroma/` vector store + embedding cache | Removes stale docs from RAG |
+| `wipe-chats` | Open WebUI chat history (`webui.db`) + uploaded files cache | Faster Open WebUI startup; no inference speedup |
+| `wipe-all` | Everything above + logs | Full clean slate |
+
+None of these affect Ollama model weights — those live in `~/.ollama/` and are managed with `ollama rm <model>`.
 
 ## Embeddings & vector DB (change model, reset index)
 
