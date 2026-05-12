@@ -25,8 +25,10 @@ from docstack.config import get_settings
 from docstack.ingest.router import ingest_path
 from docstack.index.store import (
     collection_chunk_count,
+    delete_chunks_by_filename,
     fetch_all_chunks_ordered,
     index_chunks,
+    list_indexed_docs,
     wipe_collection,
 )
 from docstack.query.ollama_client import ModelNotFoundError, chat_stream
@@ -97,6 +99,16 @@ def _clear_registry() -> None:
     p = _registry_path()
     if p.exists():
         p.unlink()
+
+
+def _remove_registry_by_filename(filename: str) -> None:
+    """Remove all hash entries whose stored filename matches filename."""
+    reg = _load_registry()
+    to_delete = [h for h, v in reg.items() if v.get("filename") == filename]
+    if to_delete:
+        for h in to_delete:
+            del reg[h]
+        _save_registry(reg)
 
 
 def _run_ingest_job(job_id: str, saved_path: Path, *, replace: bool = True) -> None:
@@ -239,6 +251,16 @@ _UPLOAD_HTML = """\
   .links a:hover{text-decoration:underline}
   #index-info{margin-top:1rem;padding:.6rem .875rem;background:#0f172a;border-radius:.5rem;font-size:.8rem;color:#64748b;text-align:center}
   #file-name{margin-top:.75rem;font-size:.85rem;color:#a5b4fc;text-align:center;min-height:1.2em}
+  #docs-section{margin-top:1.5rem}
+  #docs-section h2{font-size:.95rem;font-weight:600;color:#cbd5e1;margin-bottom:.75rem}
+  #docs-list{display:flex;flex-direction:column;gap:.4rem}
+  .doc-row{display:flex;align-items:center;gap:.5rem;background:#0f172a;border:1px solid #1e293b;border-radius:.5rem;padding:.5rem .75rem}
+  .doc-name{flex:1;font-size:.8rem;color:#e2e8f0;word-break:break-all}
+  .doc-chunks{font-size:.72rem;color:#64748b;white-space:nowrap}
+  .del-btn{background:transparent;border:1px solid #4b1f1f;color:#f87171;border-radius:.375rem;padding:.25rem .5rem;font-size:.75rem;cursor:pointer;transition:all .15s;white-space:nowrap}
+  .del-btn:hover{background:#7f1d1d;color:#fecaca;border-color:#7f1d1d}
+  .del-btn:disabled{opacity:.4;cursor:not-allowed}
+  #docs-empty{font-size:.8rem;color:#475569;text-align:center;padding:.5rem}
 </style>
 </head>
 <body>
@@ -262,6 +284,11 @@ _UPLOAD_HTML = """\
   <button class="btn" id="upload-btn" disabled>Select a file first</button>
   <div id="status"></div>
   <div id="index-info">Loading index info…</div>
+
+  <div id="docs-section">
+    <h2>📚 Indexed Documents</h2>
+    <div id="docs-list"><div id="docs-empty" style="color:#475569;font-size:.8rem;text-align:center;padding:.5rem">Loading…</div></div>
+  </div>
 
   <div class="links">
     <a href="/ingest/status">Ingest status (JSON)</a>
@@ -343,15 +370,59 @@ function showStatus(cls, msg) {
 
 async function loadInfo() {
   try {
-    const s = await (await fetch('/ingest/status')).json();
-    const chunks = await (await fetch('/ingest/chunks')).json();
+    const [s, chunks] = await Promise.all([
+      fetch('/ingest/status').then(r => r.json()),
+      fetch('/ingest/chunks').then(r => r.json()),
+    ]);
     if (chunks.count > 0) {
-      info.textContent = '📚 Index: ' + chunks.count + ' chunks · last: ' + (s.active_doc || '—');
+      info.textContent = '📊 ' + chunks.count + ' chunks in index';
     } else {
       info.textContent = '📭 Index is empty — upload a document to get started.';
     }
   } catch(_) { info.textContent = ''; }
+  await loadDocs();
 }
+
+async function loadDocs() {
+  const list = document.getElementById('docs-list');
+  try {
+    const d = await fetch('/ingest/docs').then(r => r.json());
+    const docs = d.docs || [];
+    if (docs.length === 0) {
+      list.innerHTML = '<div id="docs-empty">No documents indexed yet.</div>';
+      return;
+    }
+    list.innerHTML = docs.map(doc => `
+      <div class="doc-row" id="row-${CSS.escape(doc.filename)}">
+        <span class="doc-name" title="${doc.filename}">${doc.filename}</span>
+        <span class="doc-chunks">${doc.chunk_count} chunks</span>
+        <button class="del-btn" onclick="deleteDoc(this, '${doc.filename.replace(/'/g, "\\'")}')">🗑 Remove</button>
+      </div>
+    `).join('');
+  } catch(_) {
+    list.innerHTML = '<div id="docs-empty">Could not load document list.</div>';
+  }
+}
+
+async function deleteDoc(btn, filename) {
+  if (!confirm('Remove "' + filename + '" from the index?')) return;
+  btn.disabled = true; btn.textContent = 'Removing…';
+  try {
+    const r = await fetch('/ingest/doc/' + encodeURIComponent(filename), { method: 'DELETE' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    if (j.status === 'not_found') {
+      showStatus('err', '⚠️ Document not found in index: ' + filename);
+      btn.disabled = false; btn.textContent = '🗑 Remove'; return;
+    }
+    showStatus('ok', '✅ Removed "' + filename + '" (' + j.chunks_removed + ' chunks deleted).');
+    await loadInfo();
+  } catch(e) {
+    showStatus('err', '❌ Failed to remove: ' + e.message);
+    btn.disabled = false; btn.textContent = '🗑 Remove';
+  }
+}
+
 loadInfo();
 </script>
 </body>
@@ -391,6 +462,23 @@ async def ingest_wipe() -> dict[str, str]:
     wipe_collection()
     _clear_registry()
     return {"status": "wiped", "chunks": "0"}
+
+
+@app.get("/ingest/docs")
+async def ingest_docs() -> dict[str, Any]:
+    """List every document currently in the index with its chunk count."""
+    docs = list_indexed_docs()
+    return {"docs": docs, "total": len(docs)}
+
+
+@app.delete("/ingest/doc/{filename:path}")
+async def ingest_delete_doc(filename: str) -> dict[str, Any]:
+    """Remove all indexed chunks for a single document by filename."""
+    removed = delete_chunks_by_filename(filename)
+    _remove_registry_by_filename(filename)
+    if removed == 0:
+        return {"status": "not_found", "filename": filename, "chunks_removed": 0}
+    return {"status": "deleted", "filename": filename, "chunks_removed": removed}
 
 
 async def _save_and_start(file: UploadFile, *, replace: bool) -> JSONResponse:

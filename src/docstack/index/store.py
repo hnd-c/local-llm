@@ -153,6 +153,38 @@ def fetch_all_chunks_ordered() -> list[TextChunk]:
     return out
 
 
+def list_indexed_docs() -> list[dict[str, Any]]:
+    """Return one summary entry per unique source_filename in the index."""
+    try:
+        coll = get_collection()
+        batch = coll.get(include=["metadatas"])
+        metadatas = batch.get("metadatas") or []
+    except Exception:  # noqa: BLE001
+        return []
+    docs: dict[str, dict[str, Any]] = {}
+    for meta in metadatas:
+        m = dict(meta) if meta else {}
+        fname = m.get("source_filename", "unknown")
+        if fname not in docs:
+            docs[fname] = {"filename": fname, "chunk_count": 0}
+        docs[fname]["chunk_count"] += 1
+    return sorted(docs.values(), key=lambda x: x["filename"])
+
+
+def delete_chunks_by_filename(filename: str) -> int:
+    """Delete all chunks whose source_filename matches filename. Returns count deleted."""
+    try:
+        coll = get_collection()
+        result = coll.get(where={"source_filename": filename}, include=[])
+        ids = result.get("ids") or []
+        if ids:
+            coll.delete(ids=ids)
+        return len(ids)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to delete chunks for %s", filename)
+        return 0
+
+
 def query_similar(query: str, top_k: int) -> list[dict[str, Any]]:
     coll = get_collection()
     qemb = embed_texts([query])[0]
