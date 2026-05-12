@@ -184,7 +184,7 @@ class Filter:
         # Document types sent to DocStack for extraction + indexing.
         # Plain images (jpg/png/etc.) are intentionally excluded so they pass
         # through to the LLM as native image attachments (requires a vision
-        # model such as llava or qwen2.5-vl). To OCR-index an image document,
+        # model such as qwen2.5vl). To OCR-index an image document,
         # use the drag-and-drop uploader at http://localhost:8000 instead.
         _SUPPORTED_EXT = {
             "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt",

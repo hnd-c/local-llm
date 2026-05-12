@@ -2,13 +2,12 @@
 # Models the app expects (fast/deep). These are NOT pip packages — install Ollama, then run:
 #   docstack models pull
 # so local Ollama has the same tags. Change this list if you switch models.
-required_models = ["qwen3:4b", "qwen3:8b", "llava"]
+required_models = ["qwen3:4b", "qwen3:8b", "qwen2.5vl:7b"]
 fast_model = "qwen3:4b"
 deep_model = "qwen3:8b"
 # Vision model for image Q&A (photos, screenshots).
-# llava fits with some CPU offloading on 4 GB VRAM.
-# Lighter alternatives: moondream (1.7 GB) or llava-phi3 (2.9 GB).
-vision_model = "llava"
+# qwen2.5vl is significantly better than llava at reading text in images (OCR).
+vision_model = "qwen2.5vl:7b"
 ollama_url = "http://127.0.0.1:11434"
 # Long Nepali government PDFs (~100 pages): wider context window (lower num_ctx if GPU OOMs).
 num_ctx = 12288

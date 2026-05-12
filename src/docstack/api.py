@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz
+import httpx
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -26,7 +28,7 @@ from docstack.index.store import (
     index_chunks,
     wipe_collection,
 )
-from docstack.query.ollama_client import chat_stream
+from docstack.query.ollama_client import ModelNotFoundError, chat_stream
 from docstack.query.prompts import build_full_context_prompt, build_rag_system_prompt
 from docstack.query.retriever import retrieve
 from docstack.workflow.mapreduce import (
@@ -419,17 +421,33 @@ _DOCSTACK_NO_RAG = "[DocStack:no-rag]"
 
 
 def _strip_owui_rag_template(text: str) -> str:
-    """If Open WebUI has wrapped the user message in its RAG template
-    (### Task: ... <context>...</context> REAL_QUERY), extract and return
-    only the real query that follows the closing </context> tag.
-    Falls back to the full text unchanged if the pattern is not found."""
+    """Handle Open WebUI's RAG/URL-fetch template:
+      ### Task: Respond to the user query using the provided context
+      <context>...content...</context>
+      REAL_QUERY
+
+    - If the <context> block is empty/whitespace: return only the real query
+      (drop OWUI's empty wrapper so it doesn't confuse Ollama).
+    - If the <context> block has real content (e.g. fetched URL): preserve it
+      before the query so the model can actually see it.
+    - If the pattern is not present: return text unchanged.
+    """
     if not text.startswith(_OWUI_RAG_MARKER):
         return text
-    idx = text.rfind(_OWUI_CONTEXT_END)
-    if idx == -1:
+    ctx_start_tag = "<context>"
+    ctx_start = text.find(ctx_start_tag)
+    ctx_end = text.rfind(_OWUI_CONTEXT_END)
+    if ctx_start == -1 or ctx_end == -1:
         return text
-    real_query = text[idx + len(_OWUI_CONTEXT_END):].strip()
-    return real_query if real_query else text
+    context_content = text[ctx_start + len(ctx_start_tag):ctx_end].strip()
+    real_query = text[ctx_end + len(_OWUI_CONTEXT_END):].strip()
+    if not context_content:
+        # Empty context block — just return the query (original behaviour)
+        return real_query if real_query else text
+    # Non-empty context (URL fetch, web content, etc.) — keep it for the model
+    if real_query:
+        return f"{context_content}\n\n{real_query}"
+    return context_content
 
 
 def _is_owui_internal_task(messages: list[ChatMessage]) -> bool:
@@ -536,7 +554,21 @@ def _message_text(m: ChatMessage, fallback_user: str) -> str:
         # Strip OWUI RAG template so Ollama sees only the real query,
         # not the empty <context> tags that override our system prompt.
         return _strip_owui_rag_template(c)
-    if m.role == "user" and isinstance(c, list):
+    if isinstance(c, list):
+        # Open WebUI sends multi-part content when it fetches a URL or injects
+        # a document block alongside the user's question. Concatenate all text
+        # parts so the model sees both the scraped content and the question.
+        parts: list[str] = []
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                text = part.get("text") or ""
+                if text.strip():
+                    parts.append(_strip_owui_rag_template(text))
+        if parts:
+            return "\n\n".join(parts)
+        # List present but no usable text parts — fall back to extracted question
         return fallback_user
     return ""
 
@@ -606,10 +638,228 @@ def _sse_chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+# Match URLs and strip trailing punctuation that is likely sentence punctuation
+# rather than part of the URL (commas, periods, semicolons, colons, closing brackets).
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+_URL_TRAILING_PUNCT = re.compile(r"[.,;:!?)\]>\"']+$")
+_URL_FETCH_TIMEOUT = 10
+_URL_MAX_CHARS = 24_000
+
+
+_EN_STOPWORDS = {
+    "a", "an", "the", "is", "in", "of", "to", "and", "or", "for", "this",
+    "that", "it", "what", "how", "why", "me", "about", "can", "do", "i",
+    "my", "with", "from", "at", "be", "are", "was", "were", "has", "have",
+    "had", "not", "by", "on", "as", "its", "but", "if", "so", "we", "you",
+}
+# High-frequency Nepali function words (Devanagari) that carry little meaning
+_NE_STOPWORDS = {
+    "को", "का", "की", "मा", "र", "छ", "छन्", "हो", "हुन्", "भयो",
+    "भए", "गर्न", "गर्छ", "गर्छन्", "छु", "थियो", "थिए", "यो", "यस",
+    "त्यो", "त्यस", "जो", "जस", "यी", "ती", "हाम्रो", "तपाईं", "उनी",
+    "उनको", "उसको", "सो", "नै", "पनि", "गरी", "भनी", "भनेर", "तर",
+    "किनकि", "जब", "जहाँ", "अनि", "वा", "एक", "दुई", "लागि", "सँग",
+}
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+_DEVA_PUNCT = str.maketrans("", "", "।॥,;:!?.()")
+
+
+def _trigrams(text: str) -> set[str]:
+    """Return the set of character trigrams for a string (language-agnostic)."""
+    t = text.lower()
+    return {t[i:i+3] for i in range(len(t) - 2)} if len(t) >= 3 else set()
+
+
+def _score_paragraph(para: str, query_trigrams: set[str], query_tokens: set[str],
+                     is_nepali: bool) -> float:
+    """Return a relevance score in [0, 1] for a paragraph vs the query.
+
+    Uses character trigram overlap (language-agnostic) as primary signal,
+    supplemented by word-token overlap for Latin-script queries.
+    Normalised by paragraph length so short exact-match paragraphs don't
+    dominate over long, dense ones.
+    """
+    if not query_trigrams and not query_tokens:
+        # No query signal — prefer longer, information-dense paragraphs
+        return min(len(para), 600) / 600
+
+    length_norm = len(para) / 300 + 1  # penalise very short paragraphs less
+
+    if is_nepali or query_trigrams:
+        para_tg = _trigrams(para)
+        tg_overlap = len(query_trigrams & para_tg) / (len(query_trigrams) + 1)
+        return tg_overlap / length_norm
+
+    # English: word overlap
+    para_words = {w.lower().translate(_DEVA_PUNCT) for w in para.split()}
+    word_overlap = len(query_tokens & para_words) / (len(query_tokens) + 1)
+    return word_overlap / length_norm
+
+
+def _compress_to_limit(text: str, query: str, limit: int) -> str:
+    """Fit `text` into `limit` chars without hard truncation.
+
+    Deterministic, embedding-free, works for both English and Nepali (Devanagari):
+
+    1. Split into paragraphs on blank-line boundaries.
+    2. Always keep the first 2 paragraphs (intro / headline context).
+    3. Always keep the last 2 paragraphs (conclusion / takeaways).
+    4. Score remaining paragraphs using character trigram overlap with the query
+       (language-agnostic — handles Nepali morphology, English, mixed text).
+    5. Greedily fill the remaining char budget with highest-scoring paragraphs,
+       then re-assemble in original document order for coherent reading.
+
+    Returns text unchanged if it already fits within limit.
+    """
+    if len(text) <= limit:
+        return text
+
+    # Detect script and build query fingerprint
+    is_nepali = bool(_DEVANAGARI_RE.search(query))
+    stopwords = _NE_STOPWORDS if is_nepali else _EN_STOPWORDS
+
+    query_tokens = {
+        w.lower().translate(_DEVA_PUNCT)
+        for w in query.split()
+        if len(w) > 1 and w.lower() not in stopwords
+    }
+    query_trigrams = _trigrams(" ".join(query_tokens))
+
+    # Split into non-empty paragraphs, preserve original index
+    paras = [(i, p) for i, p in enumerate(text.split("\n\n")) if p.strip()]
+    if not paras:
+        return text[:limit]
+
+    # Anchor paragraphs: always included (intro + conclusion)
+    anchors: set[int] = {paras[0][0], paras[-1][0]}
+    if len(paras) > 1:
+        anchors.add(paras[1][0])
+    if len(paras) > 2:
+        anchors.add(paras[-2][0])
+
+    anchor_chars = sum(len(p) + 2 for idx, p in paras if idx in anchors)
+    budget = limit - anchor_chars
+
+    # Score and rank non-anchor paragraphs
+    scored: list[tuple[float, int, str]] = []
+    for idx, p in paras:
+        if idx in anchors:
+            continue
+        score = _score_paragraph(p, query_trigrams, query_tokens, is_nepali)
+        scored.append((score, idx, p))
+
+    scored.sort(key=lambda x: -x[0])
+
+    # Greedy fill within budget
+    selected_idxs: set[int] = set(anchors)
+    remaining = budget
+    for _score, idx, p in scored:
+        if remaining <= 0:
+            break
+        cost = len(p) + 2
+        if cost <= remaining:
+            selected_idxs.add(idx)
+            remaining -= cost
+
+    # Re-assemble in original document order
+    compressed = "\n\n".join(p for idx, p in paras if idx in selected_idxs)
+
+    # Safety net for very long single paragraphs
+    if len(compressed) > limit:
+        compressed = compressed[:limit]
+
+    return compressed
+
+
+async def _fetch_url_text(url: str) -> str:
+    """Fetch a URL and return a cleaned plain-text version (best-effort)."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_URL_FETCH_TIMEOUT),
+            follow_redirects=True,
+            headers={"User-Agent": "DocStack/1.0 (+https://github.com/hnd-c/local-llm)"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "html" in ct:
+                text = re.sub(r"<style[^>]*>.*?</style>", " ", resp.text, flags=re.S | re.I)
+                text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
+                text = re.sub(r"<[^>]+>", " ", text)
+                text = re.sub(r"[ \t]+", " ", text)
+                text = "\n".join(ln.strip() for ln in text.splitlines() if ln.strip())
+                # Collapse runs of blank lines into paragraph breaks
+                text = re.sub(r"\n{3,}", "\n\n", text)
+            else:
+                text = resp.text
+            return text  # raw — compression happens in _inject_url_context
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("URL fetch failed for %s: %s", url, exc)
+        return ""
+
+
+async def _inject_url_context(user_text: str) -> str:
+    """If the user message contains bare URLs, fetch each one, compress it
+    to fit the context budget while preserving the most query-relevant
+    paragraphs, then prepend the content to the message."""
+    urls = [_URL_TRAILING_PUNCT.sub("", u) for u in _URL_RE.findall(user_text)]
+    urls = list(dict.fromkeys(u for u in urls if u))  # deduplicate, preserve order
+    if not urls:
+        return user_text
+
+    # Per-URL budget: split _URL_MAX_CHARS evenly across URLs
+    per_url_limit = max(4_000, _URL_MAX_CHARS // len(urls[:3]))
+
+    fetched_blocks: list[str] = []
+    for url in urls[:3]:  # cap at 3 URLs per message
+        raw = await _fetch_url_text(url)
+        if not raw:
+            continue
+        compressed = _compress_to_limit(raw, user_text, per_url_limit)
+        fetched_blocks.append(f"[Content from {url}]\n{compressed}")
+
+    if not fetched_blocks:
+        return user_text
+    injected = "\n\n---\n\n".join(fetched_blocks)
+    return f"{injected}\n\n---\n\n{user_text}"
+
+
+def _resolve_model(requested: str | None, settings: Any) -> str | None:
+    """Normalise bare model names to their tagged equivalent.
+
+    Ollama requires an exact tag match (e.g. qwen2.5vl:7b).  If the caller
+    sends a bare name (qwen2.5vl) that matches the base of a configured model,
+    return the fully-tagged name instead so Ollama doesn't 404.
+    """
+    if not requested:
+        return requested
+    configured = [
+        settings.fast_model, settings.deep_model, settings.vision_model,
+        *settings.required_models,
+    ]
+    for model in configured:
+        if model and (model == requested or model.startswith(f"{requested}:")):
+            return model
+    return requested
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest):
     settings = get_settings()
     cid = f"chatcmpl-{secrets.token_hex(12)}"
+    body = body.model_copy(update={"model": _resolve_model(body.model, settings)})
+
+    # ── Inline URL fetch — if the last user message contains bare URLs, fetch
+    # their content and prepend it so the model can answer questions about them.
+    messages = list(body.messages)
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.role == "user" and isinstance(m.content, str):
+            enriched = await _inject_url_context(m.content)
+            if enriched != m.content:
+                messages[i] = m.model_copy(update={"content": enriched})
+            break
+    body = body.model_copy(update={"messages": messages})
 
     # ── Open WebUI internal task sub-requests (generate queries, title gen…) ──
     # These are single-message prompts that start with "### Task:" but are NOT
@@ -625,7 +875,16 @@ async def chat_completions(body: ChatCompletionRequest):
                 async for p in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
                     buf.append(p)
                 return "".join(buf)
-            text = await _collect_task()
+            try:
+                text = await _collect_task()
+            except ModelNotFoundError as exc:
+                return JSONResponse({
+                    "id": cid, "object": "chat.completion",
+                    "created": int(time.time()), "model": model_name,
+                    "choices": [{"index": 0,
+                                  "message": {"role": "assistant", "content": str(exc)},
+                                  "finish_reason": "stop"}],
+                })
             return JSONResponse({
                 "id": cid, "object": "chat.completion",
                 "created": int(time.time()), "model": model_name,
@@ -634,9 +893,12 @@ async def chat_completions(body: ChatCompletionRequest):
                               "finish_reason": "stop"}],
             })
         async def _stream_task() -> Any:
-            async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
-                if piece:
-                    yield _sse_chunk(content=piece, model=model_name, cid=cid)
+            try:
+                async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
+                    if piece:
+                        yield _sse_chunk(content=piece, model=model_name, cid=cid)
+            except ModelNotFoundError as exc:
+                yield _sse_chunk(content=str(exc), model=model_name, cid=cid)
             yield _sse_chunk(content="", model=model_name, cid=cid, finish_reason="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(_stream_task(), media_type="text/event-stream")
@@ -655,7 +917,16 @@ async def chat_completions(body: ChatCompletionRequest):
                 async for p in chat_stream(vision_model, vision_msgs, temperature=body.temperature):
                     buf.append(p)
                 return "".join(buf)
-            text = await _collect_vision()
+            try:
+                text = await _collect_vision()
+            except ModelNotFoundError as exc:
+                return JSONResponse({
+                    "id": cid, "object": "chat.completion",
+                    "created": int(time.time()), "model": vision_model,
+                    "choices": [{"index": 0,
+                                  "message": {"role": "assistant", "content": str(exc)},
+                                  "finish_reason": "stop"}],
+                })
             return JSONResponse({
                 "id": cid, "object": "chat.completion",
                 "created": int(time.time()), "model": vision_model,
@@ -664,9 +935,12 @@ async def chat_completions(body: ChatCompletionRequest):
                               "finish_reason": "stop"}],
             })
         async def _stream_vision() -> Any:
-            async for piece in chat_stream(vision_model, vision_msgs, temperature=body.temperature):
-                if piece:
-                    yield _sse_chunk(content=piece, model=vision_model, cid=cid)
+            try:
+                async for piece in chat_stream(vision_model, vision_msgs, temperature=body.temperature):
+                    if piece:
+                        yield _sse_chunk(content=piece, model=vision_model, cid=cid)
+            except ModelNotFoundError as exc:
+                yield _sse_chunk(content=str(exc), model=vision_model, cid=cid)
             yield _sse_chunk(content="", model=vision_model, cid=cid, finish_reason="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(_stream_vision(), media_type="text/event-stream")
@@ -684,7 +958,16 @@ async def chat_completions(body: ChatCompletionRequest):
                 async for p in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
                     buf.append(p)
                 return "".join(buf)
-            text = await _collect_task()
+            try:
+                text = await _collect_task()
+            except ModelNotFoundError as exc:
+                return JSONResponse({
+                    "id": cid, "object": "chat.completion",
+                    "created": int(time.time()), "model": model_name,
+                    "choices": [{"index": 0,
+                                  "message": {"role": "assistant", "content": str(exc)},
+                                  "finish_reason": "stop"}],
+                })
             return JSONResponse({
                 "id": cid, "object": "chat.completion",
                 "created": int(time.time()), "model": model_name,
@@ -693,9 +976,12 @@ async def chat_completions(body: ChatCompletionRequest):
                               "finish_reason": "stop"}],
             })
         async def _stream_task() -> Any:
-            async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
-                if piece:
-                    yield _sse_chunk(content=piece, model=model_name, cid=cid)
+            try:
+                async for piece in chat_stream(model_name, ollama_msgs, temperature=body.temperature):
+                    if piece:
+                        yield _sse_chunk(content=piece, model=model_name, cid=cid)
+            except ModelNotFoundError as exc:
+                yield _sse_chunk(content=str(exc), model=model_name, cid=cid)
             yield _sse_chunk(content="", model=model_name, cid=cid, finish_reason="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(_stream_task(), media_type="text/event-stream")
@@ -768,7 +1054,7 @@ async def chat_completions(body: ChatCompletionRequest):
             }
             for c in all_chunks
         ]
-        system_msg = build_full_context_prompt(fc_dicts, settings.max_ctx_chars)
+        system_msg = build_full_context_prompt(fc_dicts, settings.max_ctx_chars, query=user_text)
         tail = _rag_conversation_tail(body.messages, settings.rag_max_history_messages)
         fc_messages: list[dict[str, str]] = [{"role": "system", "content": system_msg}]
         for m in tail:

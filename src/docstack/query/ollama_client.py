@@ -6,11 +6,13 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-
-
 import httpx
 
 from docstack.config import get_settings
+
+
+class ModelNotFoundError(RuntimeError):
+    """Raised when Ollama returns 404 — model is not pulled yet."""
 
 
 async def chat_stream(
@@ -38,6 +40,11 @@ async def chat_stream(
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
         async with client.stream("POST", url, json=payload) as resp:
+            if resp.status_code == 404:
+                raise ModelNotFoundError(
+                    f"Model '{model}' not found in Ollama. "
+                    f"Run: ollama pull {model}"
+                )
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line:

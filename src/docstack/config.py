@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     )
     fast_model: str = "qwen3:4b"
     deep_model: str = "qwen3:8b"
-    vision_model: str = "llava"
+    vision_model: str = "qwen2.5vl:7b"
     num_ctx: int = 12288
     max_ctx_chars: int = 30000
     retrieval_top_k: int = 40

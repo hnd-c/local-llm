@@ -23,13 +23,13 @@ pip install -U pip
 pip install -e ".[webui]"
 
 # Pull all Ollama model weights declared in configs/settings.toml
-# (qwen3:4b for text/RAG, qwen3:8b for deep reasoning, llava for vision/images)
+# (qwen3:4b for text/RAG, qwen3:8b for deep reasoning, qwen2.5vl for vision/images)
 docstack models pull
 
 # Or pull each model individually:
 ollama pull qwen3:4b
 ollama pull qwen3:8b
-ollama pull llava           # vision model — ~4.7 GB
+ollama pull qwen2.5vl:7b      # vision model — better OCR/text reading than llava
 
 # After changing [ingest] embedding_model: docstack wipe-index → restart API → re-ingest (see section below).
 
@@ -41,6 +41,8 @@ open-webui serve --port 3000
 ```
 
 Or run both from the repo: **`./start.sh`** (uses `.venv`). You must include **`./`** — plain `start.sh` is not on `PATH` and will not run.
+
+Open **Open WebUI** at **[http://localhost:3000](http://localhost:3000)**.
 
 In **Open WebUI**: Settings → Connections → OpenAI API URL: `http://127.0.0.1:8000/v1` — disable built-in document RAG.
 
@@ -80,7 +82,7 @@ After that: drag a PDF / DOCX / spreadsheet into any Open WebUI chat message, hi
 
 **Re-uploading the same file is instant** — DocStack fingerprints each file with SHA-256 and skips re-indexing if the content hasn't changed. To force a full re-index, wipe first (see Option C).
 
-> **Images (JPG / PNG / etc.)** are *not* routed to DocStack — they pass through to the LLM as native image attachments. To use them you need a vision-capable model in Ollama (e.g. `ollama pull llava` or `ollama pull qwen2.5vl`). To OCR-index an image document, use the drag-and-drop uploader at `http://localhost:8000` instead.
+> **Images (JPG / PNG / etc.)** are *not* routed to DocStack — they pass through to the LLM as native image attachments. To use them you need a vision-capable model in Ollama (e.g. `ollama pull qwen2.5vl:7b`). To OCR-index an image document, use the drag-and-drop uploader at `http://localhost:8000` instead.
 
 > **Valve options** (edit in Open WebUI → Functions → gear icon):
 > `docstack_url` (default `http://localhost:8000`) · `replace_index` (default `false` = accumulate) · `poll_timeout_s` (default `300`)
@@ -148,11 +150,102 @@ cd local-llm
 | Tool | Why | Where |
 |------|-----|--------|
 | **Ollama** | LLM server (`localhost:11434`) | https://ollama.com/download/windows — leave the tray app running |
-| **Tesseract** | OCR / scans | https://github.com/UB-Mannheim/tesseract/wiki — add install folder to **PATH** |
-| **Ghostscript** | OCRmyPDF | https://www.ghostscript.com/releases/gsdnld.html — add `...\gs\bin` to **PATH**, verify with `gswin64c --version` |
+| **Tesseract** | OCR / scans | See detailed steps below |
+| **Ghostscript** | OCRmyPDF | See detailed steps below |
 | **LibreOffice** | Legacy `.doc` | https://www.libreoffice.org/download/ — default path is fine (`soffice.exe` is auto-detected) |
 
-Optional: **NVIDIA driver** so Ollama can use the GPU (`nvidia-smi` in a new Command Prompt).
+#### Tesseract (OCR)
+
+1. Go to https://github.com/UB-Mannheim/tesseract/wiki and download the latest **64-bit installer** (e.g. `tesseract-ocr-w64-setup-5.x.x.exe`).
+2. Run the installer. On the **"Choose Install Location"** screen, note the path — default is:
+   ```
+   C:\Program Files\Tesseract-OCR
+   ```
+3. Complete the install (defaults are fine; you can optionally add extra language packs during install).
+4. **Add to PATH:**
+   - Press `Win + S`, search **"Environment Variables"**, click **"Edit the system environment variables"**.
+   - Click **"Environment Variables…"** → under **System variables**, select **Path** → click **Edit**.
+   - Click **New** and add:
+     ```
+     C:\Program Files\Tesseract-OCR
+     ```
+   - Click **OK** on all dialogs.
+5. **Verify** — open a new Command Prompt and run:
+   ```bat
+   tesseract --version
+   ```
+   You should see the version number printed.
+
+#### Ghostscript (PDF rendering / OCRmyPDF)
+
+1. Go to https://www.ghostscript.com/releases/gsdnld.html and download **Ghostscript AGPL Release** → **64-bit Windows** (e.g. `gs10xx w64.exe`).
+2. Run the installer. Default install path is something like:
+   ```
+   C:\Program Files\gs\gs10.xx.x
+   ```
+3. **Add the `bin` folder to PATH:**
+   - Press `Win + S`, search **"Environment Variables"** → **Edit the system environment variables** → **Environment Variables…**
+   - Under **System variables**, select **Path** → **Edit** → **New**, then add (adjust version number):
+     ```
+     C:\Program Files\gs\gs10.05.1\bin
+     ```
+   - Click **OK** on all dialogs.
+4. **Verify** — open a new Command Prompt and run:
+   ```bat
+   gswin64c --version
+   ```
+   You should see output like `10.05.1`. If it says "not recognized", double-check the path added matches the actual folder on disk.
+
+### NVIDIA Driver Installation (GTX 1050 Ti — required for GPU acceleration)
+
+Without the driver, Ollama runs everything on CPU and is very slow. Follow these steps once:
+
+**Step 1 — Download the correct driver**
+
+Go to https://www.nvidia.com/Download/index.aspx and fill in:
+
+| Field | Value |
+|-------|-------|
+| Product Type | GeForce |
+| Product Series | GeForce 10 Series |
+| Product | GeForce GTX 1050 Ti |
+| Operating System | Windows 10 64-bit / Windows 11 |
+| Download Type | Game Ready Driver (GRD) |
+| Language | English |
+
+Click **Search → Download**. The installer will be a `.exe` file (~500 MB).
+
+**Step 2 — Install**
+
+1. Run the downloaded `.exe` as Administrator.
+2. Choose **Express Installation** (installs driver + PhysX + HD Audio).
+3. Restart when prompted.
+
+**Step 3 — Restart the PC**
+
+A full reboot is required after driver installation. Ollama will not detect the GPU until the system has restarted.
+
+**Step 4 — Verify the driver**
+
+Open a new **Command Prompt** and run:
+```bat
+nvidia-smi
+```
+You should see your GPU listed with driver version and memory usage.
+
+**Step 5 — No code changes needed**
+
+Ollama automatically detects and uses the NVIDIA GPU via CUDA — nothing needs to change in the codebase or config. Simply start Ollama (tray app or `ollama serve`) and run `start.bat` as normal.
+
+**Step 6 — Confirm Ollama is using the GPU**
+
+Run a model, then in a separate Command Prompt run `nvidia-smi`. You should see `ollama` or `ollama_llama_se` listed under **Processes** with non-zero GPU memory:
+```bat
+ollama run qwen3:4b "hello"
+```
+Or open **Task Manager → Performance → GPU** — GPU utilisation should spike during inference.
+
+> **VRAM note (4 GB):** `qwen3:4b` (~3.5 GB) fits fully on GPU and runs fast. `qwen3:8b` and `qwen2.5vl` (~5–6 GB) exceed 4 GB and will partially offload layers to CPU — they will still be faster than pure CPU but slower than a full GPU fit.
 
 More detail: [PLAN.md — Windows Deployment](PLAN.md#windows-deployment-native--no-docker-no-wsl2-required).
 
@@ -167,13 +260,13 @@ py -3.12 -m venv .venv
 pip install -U pip
 pip install -e ".[webui]"
 
-REM Pull all Ollama model weights (qwen3:4b, qwen3:8b, llava)
+REM Pull all Ollama model weights (qwen3:4b, qwen3:8b, qwen2.5vl:7b)
 docstack models pull
 
 REM Or pull each model individually:
 REM ollama pull qwen3:4b
 REM ollama pull qwen3:8b
-REM ollama pull llava
+REM ollama pull qwen2.5vl:7b
 ```
 
 After you change **`[ingest] embedding_model`**, run **`docstack wipe-index`**, restart the API, and re-ingest (same steps as the **Embeddings & vector DB** section above).
@@ -192,7 +285,7 @@ If `py -3.12` is missing, install Python 3.12 or edit [start.bat](start.bat) / u
 
 ### 5. Same wiring as Mac
 
-- **Open WebUI**: Settings → Connections → **OpenAI API URL** `http://127.0.0.1:8000/v1` (or `http://localhost:8000/v1`), API key any non-empty string.
+- **Open WebUI** at **[http://localhost:3000](http://localhost:3000)**: Settings → Connections → **OpenAI API URL** `http://127.0.0.1:8000/v1` (or `http://localhost:8000/v1`), API key any non-empty string.
 - **Index files** via [http://127.0.0.1:8000/](http://127.0.0.1:8000/) (Option A) or install the Filter Function for seamless chat-box uploads (Option B above).
 
 ## License

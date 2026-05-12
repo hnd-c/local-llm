@@ -40,6 +40,28 @@ goto :wait_ollama
 
 :after_ollama
 
+REM ── Check required models are pulled ─────────────────────────────────────────
+echo.
+echo Checking Ollama models...
+ollama list 2>nul
+if errorlevel 1 (
+  echo WARNING: Could not query Ollama model list.
+) else (
+  echo Required: qwen3:4b  qwen3:8b  qwen2.5vl
+  echo If any are missing, run: docstack models pull
+)
+echo.
+
+REM ── Free ports 8000 and 3000 before starting (kills any leftover processes) ──
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R ":8000 .*LISTENING" 2^>nul') do (
+  echo Stopping process on port 8000 (PID: %%p)...
+  taskkill /PID %%p /F >nul 2>&1
+)
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /R ":3000 .*LISTENING" 2^>nul') do (
+  echo Stopping process on port 3000 (PID: %%p)...
+  taskkill /PID %%p /F >nul 2>&1
+)
+
 if not exist ".venv\Scripts\uvicorn.exe" (
   echo Create .venv first: py -3.12 -m venv .venv ^&^& .venv\Scripts\activate ^&^& pip install -U pip ^&^& pip install -e ".[webui]"
   exit /b 1

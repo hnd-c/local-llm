@@ -39,7 +39,68 @@ ensure_ollama() {
   exit 1
 }
 
+free_port() {
+  local port="$1"
+  local pids
+  pids=$(lsof -ti tcp:"$port" 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    echo "Stopping process(es) on port $port (PID: $pids)…"
+    echo "$pids" | xargs kill -TERM 2>/dev/null || true
+    local i=0
+    while (( i < 20 )); do
+      pids=$(lsof -ti tcp:"$port" 2>/dev/null || true)
+      [[ -z "$pids" ]] && return 0
+      sleep 0.2
+      (( i++ )) || true
+    done
+    echo "$pids" | xargs kill -KILL 2>/dev/null || true
+  fi
+}
+
 ensure_ollama
+
+check_models() {
+  # Read required_models from configs/settings.toml (handles quoted, comma-separated list)
+  local config="$ROOT/configs/settings.toml"
+  if [[ ! -f "$config" ]]; then return; fi
+  local line
+  line=$(grep '^required_models' "$config" | head -1)
+  # Extract model names from: required_models = ["qwen3:4b", "qwen3:8b", "qwen2.5vl"]
+  local models=()
+  while IFS= read -r m; do
+    models+=("$m")
+  done < <(echo "$line" | grep -oE '"[^"]+"' | tr -d '"')
+
+  local pulled
+  pulled=$(curl -sf --max-time 5 "${OLLAMA_URL}/api/tags" | grep -oE '"name":"[^"]+"' | cut -d'"' -f4 || true)
+
+  local missing=()
+  for model in "${models[@]}"; do
+    # Match model name with or without :latest tag
+    local base="${model%%:*}"
+    if ! echo "$pulled" | grep -q "^${base}"; then
+      missing+=("$model")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo ""
+    echo "⚠  Missing Ollama models: ${missing[*]}"
+    echo "   Run:  ollama pull ${missing[0]}"
+    for m in "${missing[@]:1}"; do
+      echo "         ollama pull $m"
+    done
+    echo "   Or:   docstack models pull   (pulls all at once)"
+    echo ""
+  else
+    echo "All required models are present: ${models[*]}"
+  fi
+}
+
+check_models
+
+free_port 8000
+free_port 3000
 
 if [[ ! -x "$VENV/bin/uvicorn" ]]; then
   echo "Missing $VENV. Create it with Python 3.12, then: pip install -e \".[webui]\""
