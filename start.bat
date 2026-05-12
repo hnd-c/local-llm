@@ -1,7 +1,7 @@
 @echo off
 REM Requires: .venv with Python 3.12 and: pip install -e ".[webui]"
 REM Ensures Ollama is reachable (starts ollama serve in a minimized window if needed).
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 if not defined OLLAMA_URL set "OLLAMA_URL=http://127.0.0.1:11434"
@@ -23,7 +23,7 @@ echo Ollama not responding; starting ollama serve in the background...
 if not exist "data" mkdir data
 start "Ollama" /MIN /D "%~dp0" cmd /c "ollama serve >> data\ollama-serve.log 2>&1"
 
-set /a i=0
+set i=0
 :wait_ollama
 curl -sf --max-time 2 "%OLLAMA_URL%/api/tags" >nul 2>&1
 if not errorlevel 1 (
@@ -31,7 +31,7 @@ if not errorlevel 1 (
   goto :after_ollama
 )
 set /a i+=1
-if %i% geq 11 (
+if !i! geq 11 (
   echo Ollama did not become ready (tried ~10s). See %~dp0data\ollama-serve.log
   exit /b 1
 )
