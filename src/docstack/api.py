@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import asynccontextmanager
 import json
 import logging
 import re
@@ -174,7 +175,25 @@ def _run_ingest_job(job_id: str, saved_path: Path, *, replace: bool = True) -> N
             _ingest_state.update({"status": "failed", "error": str(e)})
 
 
-app = FastAPI(title="DocStack RAG", version="0.1.0")
+@asynccontextmanager
+async def lifespan(fastapi_app: Any):
+    # Pre-warm the embedding model in a background thread so the first user
+    # query doesn't pay the 5–20s SentenceTransformer load penalty.
+    import asyncio
+    from docstack.index.embedder import embed_texts
+
+    def _warm() -> None:
+        try:
+            embed_texts(["warmup"])
+            logger.info("Embedding model pre-warmed and ready.")
+        except Exception as exc:
+            logger.warning("Embedding model pre-warm failed (non-fatal): %s", exc)
+
+    asyncio.get_event_loop().run_in_executor(None, _warm)
+    yield
+
+
+app = FastAPI(title="DocStack RAG", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
