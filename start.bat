@@ -56,12 +56,14 @@ echo If any are missing, run:  docstack models pull
 echo.
 
 REM ── Free ports 8000 and 3000 before starting ─────────────────────────────────
-for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8000 "') do (
-  taskkill /PID %%p /F >nul 2>&1
+netstat -ano >"%TEMP%\ds_netstat.txt" 2>nul
+for /f "tokens=5" %%p in ('findstr ":8000 " "%TEMP%\ds_netstat.txt" 2^>nul') do (
+  if not "%%p"=="" taskkill /PID %%p /F >nul 2>&1
 )
-for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3000 "') do (
-  taskkill /PID %%p /F >nul 2>&1
+for /f "tokens=5" %%p in ('findstr ":3000 " "%TEMP%\ds_netstat.txt" 2^>nul') do (
+  if not "%%p"=="" taskkill /PID %%p /F >nul 2>&1
 )
+del "%TEMP%\ds_netstat.txt" >nul 2>&1
 
 REM ── Ensure .venv exists ───────────────────────────────────────────────────────
 if not exist ".venv\Scripts\uvicorn.exe" (
